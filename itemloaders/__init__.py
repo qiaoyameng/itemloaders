@@ -15,6 +15,16 @@ from parsel.utils import extract_regex, flatten
 
 from itemloaders.common import wrap_loader_context
 from itemloaders.processors import Identity
+from itemloaders.provenance import (
+    Drop,
+    Node,
+    ProcessorStep,
+    ProvenanceReport,
+    ProvenanceTracker,
+    Source,
+    _align as _align_nodes,
+    apply_processor_tracked,
+)
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
@@ -54,6 +64,13 @@ class ItemLoader:
         :meth:`~ItemLoader.add_xpath`, :meth:`~ItemLoader.add_css`,
         :meth:`~ItemLoader.add_jmes` or :meth:`~ItemLoader.add_value`.
     :type item: :class:`dict` object
+
+    :param track_provenance: If ``True``, record where every collected value
+        comes from (selector expression, input batch and processor steps), so
+        that :meth:`get_provenance` can trace a field output back to its
+        sources. Disabled by default; when disabled there is no change in
+        behavior or overhead beyond a single attribute check.
+    :type track_provenance: bool
 
     :param selector: The selector to extract data from, when using the
         :meth:`add_xpath` (resp. :meth:`add_css`, :meth:`add_jmes`) or :meth:`replace_xpath`
@@ -128,12 +145,21 @@ class ItemLoader:
         selector: Selector | None = None,
         parent: ItemLoader | None = None,
         stats: _StatsCollector | None = None,
+        track_provenance: bool = False,
         **context: Any,
     ):
         self.selector: Selector | None = selector
         self.stats: _StatsCollector | None = (
             stats if stats is not None or parent is None else parent.stats
         )
+        if track_provenance:
+            self._tracker: ProvenanceTracker | None = ProvenanceTracker()
+        elif parent is not None:
+            self._tracker = parent._tracker
+        else:
+            self._tracker = None
+        self._pending_prov: list[Node] | None = None
+        self._pending_drops: list[Drop] = []
         context.update(selector=selector)
         # An item built here has no data, only the field defaults of its class,
         # which must not be mistaken for loaded values.
@@ -149,6 +175,11 @@ class ItemLoader:
             for field_name, value in ItemAdapter(item).items():
                 self._values.setdefault(field_name, [])
                 self._values[field_name] += arg_to_iter(value)
+                if self._tracker is not None:
+                    self._tracker.collected.setdefault(field_name, [])
+                    self._tracker.collected[field_name] += [
+                        Source("item", None, v, 0) for v in arg_to_iter(value)
+                    ]
 
     @property
     def _values(self) -> dict[str, list[Any]]:
@@ -230,14 +261,19 @@ class ItemLoader:
             loader.add_value(None, {'name': 'foo', 'sex': 'male'})
 
         """
-        value = self.get_value(value, *processors, re=re, **kw)
-        if value is None:
-            return self
-        if not field_name:
-            for k, v in value.items():
-                self._add_value(k, v)
-        else:
-            self._add_value(field_name, value)
+        if self._tracker is not None:
+            self._ensure_pending_provenance(value)
+        try:
+            value = self.get_value(value, *processors, re=re, **kw)
+            if value is None:
+                return self
+            if not field_name:
+                for k, v in value.items():
+                    self._add_value(k, v)
+            else:
+                self._add_value(field_name, value)
+        finally:
+            self._clear_pending_provenance()
         return self
 
     def replace_value(
@@ -255,25 +291,54 @@ class ItemLoader:
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
         """
-        value = self.get_value(value, *processors, re=re, **kw)
-        if value is None:
-            return self
-        if not field_name:
-            for k, v in value.items():
-                self._replace_value(k, v)
-        else:
-            self._replace_value(field_name, value)
+        if self._tracker is not None:
+            self._ensure_pending_provenance(value)
+        try:
+            value = self.get_value(value, *processors, re=re, **kw)
+            if value is None:
+                return self
+            if not field_name:
+                for k, v in value.items():
+                    self._replace_value(k, v)
+            else:
+                self._replace_value(field_name, value)
+        finally:
+            self._clear_pending_provenance()
         return self
+
+    def _ensure_pending_provenance(self, value: Any) -> None:
+        if self._pending_prov is None and self._tracker is not None:
+            batch = self._tracker.next_batch()
+            self._pending_prov = [
+                Source("value", None, v, batch) for v in arg_to_iter(value)
+            ]
+
+    def _clear_pending_provenance(self) -> None:
+        if self._tracker is not None:
+            self._pending_prov = None
+            self._pending_drops = []
 
     def _add_value(self, field_name: str, value: Any) -> None:
         value = arg_to_iter(value)
         processed_value = self._process_input_value(field_name, value)
+        if self._tracker is not None:
+            if self._pending_drops:
+                self._tracker.field_drops(field_name).extend(self._pending_drops)
+                self._pending_drops = []
+            if processed_value:
+                self._tracker.collected.setdefault(field_name, [])
+                self._tracker.collected[field_name] += self._pending_prov or []
         if processed_value:
             self._values.setdefault(field_name, [])
             self._values[field_name] += arg_to_iter(processed_value)
 
     def _replace_value(self, field_name: str, value: Any) -> None:
         self._values.pop(field_name, None)
+        if self._tracker is not None:
+            self._tracker.collected.pop(field_name, None)
+            self._tracker.output.pop(field_name, None)
+            self._tracker.drops.pop(field_name, None)
+            self._tracker.output_drops.pop(field_name, None)
         self._add_value(field_name, value)
 
     def get_value(
@@ -302,22 +367,57 @@ class ItemLoader:
         >>> loader.get_value('name: foo', TakeFirst(), str.upper, re='name: (.+)')
         'FOO'
         """
+        tracking = self._tracker is not None and self._pending_prov is not None
         if re:
             value = arg_to_iter(value)
-            value = flatten(extract_regex(re, x) for x in value)
+            if tracking:
+                pattern = getattr(re, "pattern", re)
+                nodes = _align_nodes(self._pending_prov or [], len(value))
+                new_values: list[Any] = []
+                new_nodes: list[Node] = []
+                for x, node in zip(value, nodes, strict=True):
+                    for match in extract_regex(re, x):
+                        new_values.append(match)
+                        new_nodes.append(
+                            ProcessorStep(
+                                processor=f"re:{pattern}",
+                                value=match,
+                                inputs=[node],
+                                mode="mapped",
+                            )
+                        )
+                value = new_values
+                self._pending_prov = new_nodes
+            else:
+                value = flatten(extract_regex(re, x) for x in value)
 
         for proc in processors:
             if value is None:
                 break
             _proc = proc
-            proc = wrap_loader_context(proc, self.context)  # noqa: PLW2901
-            try:
-                value = proc(value)
-            except Exception as e:
-                raise ValueError(
-                    f"Error with processor {_proc.__class__.__name__} "
-                    f"value={value!r} error='{type(e).__name__}: {e!s}'"
-                ) from e
+            if tracking:
+                try:
+                    value, self._pending_prov = apply_processor_tracked(
+                        _proc,
+                        value,
+                        self._pending_prov or [],
+                        self.context,
+                        self._pending_drops,
+                    )
+                except Exception as e:
+                    raise ValueError(
+                        f"Error with processor {_proc.__class__.__name__} "
+                        f"value={value!r} error='{type(e).__name__}: {e!s}'"
+                    ) from e
+            else:
+                proc = wrap_loader_context(proc, self.context)  # noqa: PLW2901
+                try:
+                    value = proc(value)
+                except Exception as e:
+                    raise ValueError(
+                        f"Error with processor {_proc.__class__.__name__} "
+                        f"value={value!r} error='{type(e).__name__}: {e!s}'"
+                    ) from e
         return value
 
     def load_item(self) -> Any:
@@ -340,6 +440,22 @@ class ItemLoader:
         given field. This method doesn't populate or modify the item at all.
         """
         proc = self.get_output_processor(field_name)
+        if self._tracker is not None:
+            value = self._values.get(field_name, [])
+            provs = self._tracker.collected.get(field_name, [])
+            output_drops: list[Drop] = []
+            try:
+                result, out_provs = apply_processor_tracked(
+                    proc, value, provs, self.context, output_drops
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Error with output processor: field={field_name!r} "
+                    f"value={value!r} error='{type(e).__name__}: {e!s}'"
+                ) from e
+            self._tracker.output[field_name] = out_provs
+            self._tracker.output_drops[field_name] = output_drops
+            return result
         proc = wrap_loader_context(proc, self.context)
         value = self._values.get(field_name, [])
         try:
@@ -353,6 +469,31 @@ class ItemLoader:
     def get_collected_values(self, field_name: str) -> list[Any]:
         """Return the collected values for the given field."""
         return self._values.get(field_name, [])
+
+    def get_provenance(self, field_name: str) -> ProvenanceReport:
+        """
+        Return the provenance report for the given field: which sources
+        (selector expressions and input batches) and processor steps produced
+        the field output, and which values were dropped along the way.
+
+        Requires the loader to have been created with
+        ``track_provenance=True``.
+        """
+        if self._tracker is None:
+            raise RuntimeError(
+                "Provenance tracking is disabled; pass track_provenance=True "
+                "when creating the ItemLoader to use get_provenance()"
+            )
+        tracker = self._tracker
+        if field_name not in tracker.output and field_name in self._values:
+            self.get_output_value(field_name)
+        return ProvenanceReport(
+            field_name=field_name,
+            output=list(tracker.output.get(field_name, [])),
+            collected=list(tracker.collected.get(field_name, [])),
+            drops=list(tracker.drops.get(field_name, []))
+            + list(tracker.output_drops.get(field_name, [])),
+        )
 
     def get_input_processor(self, field_name: str) -> Callable[..., Any]:
         proc = getattr(self, f"{field_name}_in", None)
@@ -379,6 +520,21 @@ class ItemLoader:
     def _process_input_value(self, field_name: str, value: Any) -> Any:
         proc = self.get_input_processor(field_name)
         _proc = proc
+        if self._tracker is not None:
+            try:
+                result, self._pending_prov = apply_processor_tracked(
+                    proc,
+                    value,
+                    self._pending_prov or [],
+                    self.context,
+                    self._tracker.field_drops(field_name),
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Error with input processor {_proc.__class__.__name__}:"
+                    f" field={field_name!r} value={value!r} error='{type(e).__name__}: {e!s}'"
+                ) from e
+            return result
         proc = wrap_loader_context(proc, self.context)
         try:
             return proc(value)
@@ -480,7 +636,10 @@ class ItemLoader:
 
         """
         values = self._get_xpathvalues(xpath, **kw)
-        return self.get_value(values, *processors, re=re, **kw)
+        try:
+            return self.get_value(values, *processors, re=re, **kw)
+        finally:
+            self._clear_pending_provenance()
 
     def _get_xpathvalues(
         self,
@@ -491,6 +650,18 @@ class ItemLoader:
         self._check_selector_method()
         assert self.selector is not None
         xpaths = arg_to_iter(xpaths)
+        if self._tracker is not None:
+            batch = self._tracker.next_batch()
+            values: list[Any] = []
+            nodes: list[Node] = []
+            for xpath in xpaths:
+                got = self._track_rule(
+                    field_name, "xpath", xpath, self.selector.xpath(xpath, **kw).getall()
+                )
+                values += got
+                nodes += [Source("xpath", xpath, v, batch) for v in got]
+            self._pending_prov = nodes
+            return values
         return flatten(
             self._track_rule(
                 field_name, "xpath", xpath, self.selector.xpath(xpath, **kw).getall()
@@ -574,7 +745,10 @@ class ItemLoader:
             loader.get_css('p#price', TakeFirst(), re='the price is (.*)')
         """
         values = self._get_cssvalues(css)
-        return self.get_value(values, *processors, re=re, **kw)
+        try:
+            return self.get_value(values, *processors, re=re, **kw)
+        finally:
+            self._clear_pending_provenance()
 
     def _get_cssvalues(
         self, csss: str | Iterable[str], field_name: str | None = None
@@ -582,6 +756,18 @@ class ItemLoader:
         self._check_selector_method()
         assert self.selector is not None
         csss = arg_to_iter(csss)
+        if self._tracker is not None:
+            batch = self._tracker.next_batch()
+            values = []
+            nodes = []
+            for css in csss:
+                got = self._track_rule(
+                    field_name, "css", css, self.selector.css(css).getall()
+                )
+                values += got
+                nodes += [Source("css", css, v, batch) for v in got]
+            self._pending_prov = nodes
+            return values
         return flatten(
             self._track_rule(field_name, "css", css, self.selector.css(css).getall())
             for css in csss
@@ -661,7 +847,10 @@ class ItemLoader:
             loader.get_jmes('price', TakeFirst(), re='the price is (.*)')
         """
         values = self._get_jmesvalues(jmes)
-        return self.get_value(values, *processors, re=re, **kw)
+        try:
+            return self.get_value(values, *processors, re=re, **kw)
+        finally:
+            self._clear_pending_provenance()
 
     def _get_jmesvalues(
         self, jmess: str | Iterable[str], field_name: str | None = None
@@ -673,6 +862,18 @@ class ItemLoader:
             raise AttributeError(
                 "Please install parsel >= 1.8.1 to get JMESPath support"
             )
+        if self._tracker is not None:
+            batch = self._tracker.next_batch()
+            values = []
+            nodes = []
+            for jmes in jmess:
+                got = self._track_rule(
+                    field_name, "jmes", jmes, self.selector.jmespath(jmes).getall()
+                )
+                values += got
+                nodes += [Source("jmes", jmes, v, batch) for v in got]
+            self._pending_prov = nodes
+            return values
         return flatten(
             self._track_rule(
                 field_name, "jmes", jmes, self.selector.jmespath(jmes).getall()
