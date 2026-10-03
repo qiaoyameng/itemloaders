@@ -5,6 +5,28 @@
 Release notes
 =============
 
+.. _release-unreleased:
+
+Unreleased
+----------
+
+-   Added optional value-origin tracking to :class:`ItemLoader`. Create a
+    loader (root or nested) with ``track_sources=True`` and call
+    :meth:`~ItemLoader.get_field_trace` to inspect, for each field, the
+    selector expressions, input batches and processor steps that produced the
+    collected values and the field output. Tracking covers one-to-many
+    expansions, filtered ``None`` values, processor errors, and the inputs
+    adopted by aggregating processors (TakeFirst_, Join_); custom processors
+    are recorded as whole-batch dependencies. Tracking data is kept separate
+    from user values (processors never receive wrapped objects), nested
+    loaders share the tracking store without leaking sources across fields,
+    ``replace_*`` removes the replaced origins from the current result, and
+    the feature is fully disabled (with no extra processing) when the flag is
+    off. See :ref:`source-tracking`.
+
+.. _TakeFirst: api-reference.html#itemloaders.processors.TakeFirst
+.. _Join: api-reference.html#itemloaders.processors.Join
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)

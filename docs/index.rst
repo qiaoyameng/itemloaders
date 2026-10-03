@@ -108,6 +108,7 @@ Contents
     nested-loaders
     extending-loaders
     rule-usage
+    source-tracking
     built-in-processors
     api-reference
     release-notes
