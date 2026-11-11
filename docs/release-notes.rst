@@ -5,6 +5,26 @@
 Release notes
 =============
 
+.. _release-1.6.0:
+
+itemloaders 1.6.0 (unreleased)
+------------------------------
+
+-   Added asynchronous counterparts of the :class:`ItemLoader` entry points:
+    :meth:`~ItemLoader.async_add_value`,
+    :meth:`~ItemLoader.async_replace_value`,
+    :meth:`~ItemLoader.async_get_value`,
+    :meth:`~ItemLoader.async_get_output_value` and
+    :meth:`~ItemLoader.async_load_item`, together with ``async_add_*`` and
+    ``async_replace_*`` variants for XPath, CSS and JMESPath selectors.
+    Processors, including the functions inside :class:`MapCompose` and
+    :class:`Compose`, may now be regular callables, ``async`` callables, or a
+    mix of both. See :ref:`asynchronous-processors`.
+
+-   Synchronous loader methods now raise :class:`TypeError` when a processor
+    returns an awaitable, instead of collecting the coroutine object. The
+    unused coroutine is closed so it is not reported as never awaited.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)

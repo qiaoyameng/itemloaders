@@ -95,3 +95,46 @@ item types where unassigned fields are absent, such as :class:`dict` or
 For a field to be present regardless of what is collected, use an item class
 that gives its fields a default value, such as a :mod:`dataclasses` or
 ``attrs`` class.
+
+.. _asynchronous-processors:
+
+Asynchronous processors
+-----------------------
+
+When a processor has to await something (for example a call to a local
+service), define it as an ``async`` function and use the asynchronous
+counterparts of the loader methods: :meth:`~ItemLoader.async_add_value`,
+:meth:`~ItemLoader.async_replace_value`, :meth:`~ItemLoader.async_get_value`,
+:meth:`~ItemLoader.async_get_output_value` and
+:meth:`~ItemLoader.async_load_item`, plus the selector variants
+:meth:`~ItemLoader.async_add_xpath`, :meth:`~ItemLoader.async_add_css`,
+:meth:`~ItemLoader.async_add_jmes` and their ``async_replace_*`` equivalents.
+
+Regular callables and ``async`` callables can be mixed freely inside a
+processor chain, including within :class:`MapCompose` and :class:`Compose`.
+Each function in the chain is awaited in order, and the
+:ref:`loader context <loaders-context>`, including for nested loaders, is
+passed the same way as in synchronous chains::
+
+    async def normalize(value):
+        response = await local_client.lookup(value)
+        return response["normalized"]
+
+    class MyLoader(ItemLoader):
+        name_in = MapCompose(str.strip, normalize)
+
+    loader = MyLoader()
+    await loader.async_add_value("name", "  marta  ")
+    item = await loader.async_load_item()
+
+Output processors may be asynchronous too. Collected values and item fields
+are only updated once the whole asynchronous operation succeeds: on failure
+or cancellation the original exception keeps its processor location, the
+previous values are left untouched, and every coroutine that will not be
+awaited is closed.
+
+The synchronous methods never start an event loop themselves. If a
+synchronous entry point such as :meth:`~ItemLoader.add_value` or
+:meth:`~ItemLoader.load_item` reaches an awaitable returned by a processor,
+it raises :class:`TypeError` and closes the unused coroutine. Use the
+``async_*`` methods instead.
