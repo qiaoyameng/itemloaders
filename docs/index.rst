@@ -108,6 +108,7 @@ Contents
     nested-loaders
     extending-loaders
     rule-usage
+    transaction
     built-in-processors
     api-reference
     release-notes

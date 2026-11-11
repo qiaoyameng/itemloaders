@@ -5,6 +5,16 @@
 Release notes
 =============
 
+Unreleased
+----------
+
+-   Added the :meth:`~ItemLoader.transaction` context manager, which makes a
+    block of loader changes atomic: if a processor or an item assignment
+    fails, the collected values (including the values shared with nested
+    loaders), the item fields and the rule usage statistics are restored to
+    what they were when the block started, and the exception is re-raised so
+    parsing can continue with the same loader. See :ref:`transactions`.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)

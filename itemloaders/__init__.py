@@ -6,7 +6,8 @@ See documentation in :ref:`declaring-loaders`.
 
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Protocol, Self
 
 from itemadapter import ItemAdapter
@@ -18,7 +19,7 @@ from itemloaders.processors import Identity
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, MutableMapping
+    from collections.abc import Callable, Iterable, Iterator, MutableMapping
     from re import Pattern
 
 
@@ -142,6 +143,8 @@ class ItemLoader:
         self.context: MutableMapping[str, Any] = context
         self.parent: ItemLoader | None = parent
         self._local_values: dict[str, list[Any]] = {}
+        self._local_stats_journal: dict[str, int] = {}
+        self._transaction_stack: list[dict[str, Any]] = []
         if has_initial_values:
             for field_name, value in ItemAdapter(item).items():
                 self._values.setdefault(field_name, [])
@@ -158,6 +161,74 @@ class ItemLoader:
         if self.parent is not None:
             return self.parent.item
         return self._local_item
+
+    @contextmanager
+    def transaction(self) -> Iterator[Self]:
+        """
+        Context manager that groups loader changes into an atomic unit.
+
+        On entering, the state managed by the loader (the collected values,
+        including the values shared with nested loaders, the item, and the
+        rule usage statistics) is snapshotted. If the ``with`` block raises,
+        that state is restored to what it was when the block started and the
+        exception is re-raised, so the same loader can keep collecting data
+        afterwards. When the block exits without an exception, the changes
+        are kept, and an outer transaction still gets to roll them back if
+        it fails later.
+
+        Side effects performed by user code, such as input or output
+        processors mutating external objects, are not tracked and are not
+        rolled back.
+
+        .. versionadded:: VERSION
+        """
+        root = self._root_loader
+        snapshot = root._snapshot()
+        root._transaction_stack.append(snapshot)
+        try:
+            yield self
+        except BaseException:
+            root._rollback(snapshot)
+            raise
+        finally:
+            root._transaction_stack.pop()
+
+    @property
+    def _root_loader(self) -> ItemLoader:
+        root = self
+        while root.parent is not None:
+            root = root.parent
+        return root
+
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            "values": deepcopy(self._local_values),
+            "item": deepcopy(self._local_item),
+            "journal": dict(self._stats_journal),
+        }
+
+    def _rollback(self, snapshot: dict[str, Any]) -> None:
+        self._local_values = deepcopy(snapshot["values"])
+        # Restore the item in place so references held by nested loaders and
+        # their contexts keep pointing at the same item object.
+        adapter = ItemAdapter(self._local_item)
+        for field_name in list(adapter.field_names()):
+            del adapter[field_name]
+        snapshot_adapter = ItemAdapter(snapshot["item"])
+        for field_name in snapshot_adapter.field_names():
+            adapter[field_name] = deepcopy(snapshot_adapter[field_name])
+        journal = self._stats_journal
+        if self.stats is not None:
+            for key, increments in journal.items():
+                undo = snapshot["journal"].get(key, 0) - increments
+                if undo:
+                    self.stats.inc_value(key, undo)
+        journal.clear()
+        journal.update(snapshot["journal"])
+
+    @property
+    def _stats_journal(self) -> dict[str, int]:
+        return self._root_loader._local_stats_journal
 
     def nested_xpath(self, xpath: str, **context: Any) -> Self:
         """
@@ -390,7 +461,13 @@ class ItemLoader:
     ) -> list[Any]:
         if self.stats is not None:
             key = f"parser/{field_name or '<none>'}/{rule_type}/{rule}"
-            self.stats.inc_value(key, 1 if values else 0)
+            count = 1 if values else 0
+            self.stats.inc_value(key, count)
+            root = self._root_loader
+            if root._transaction_stack:
+                root._local_stats_journal[key] = (
+                    root._local_stats_journal.get(key, 0) + count
+                )
         return values
 
     def _check_selector_method(self) -> None:
