@@ -6,14 +6,67 @@ See documentation in :ref:`declaring-loaders`.
 
 from __future__ import annotations
 
+import itertools
 from collections import ChainMap
-from typing import TYPE_CHECKING, Any
+from functools import partial
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from itemloaders.common import wrap_loader_context
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, MutableMapping
+    from collections.abc import Callable, Iterable, Iterator, MutableMapping
+
+
+@runtime_checkable
+class BatchProcessor(Protocol):
+    """Protocol for functions that process a batch of values at once.
+
+    A batch processor receives a list of input values and must return an
+    iterable with exactly one entry per input value, in the same order. Each
+    entry maps to the outputs of the corresponding input value: ``None`` or
+    an empty iterable means the input produced no output, a plain value means
+    exactly one output, and an iterable of values means several outputs.
+
+    Batch processors must not keep state between calls: every call receives a
+    self-contained batch of values.
+
+    Use :func:`batch` to mark a function as a batch processor, so that
+    :class:`MapCompose` calls it once per batch of values instead of once per
+    value.
+    """
+
+    def __call__(self, values: list[Any]) -> Iterable[Any]: ...
+
+
+def batch(function: Callable[[list[Any]], Iterable[Any]]) -> BatchProcessor:
+    """Mark *function* as a :class:`BatchProcessor` for :class:`MapCompose`.
+
+    *function* must receive a list of values and return an iterable with one
+    entry per input value, as described in :class:`BatchProcessor`. It can be
+    used as a decorator::
+
+        @batch
+        def strip_all(values):
+            return [value.strip() for value in values]
+    """
+    setattr(function, "__is_batch_processor__", True)
+    return cast("BatchProcessor", function)
+
+
+def _is_batch_processor(function: Callable[..., Any]) -> bool:
+    # functools.partial does not forward arbitrary attributes, so a batch
+    # processor wrapped with a loader context must be unwrapped first.
+    while isinstance(function, partial):
+        function = function.func
+    return getattr(function, "__is_batch_processor__", False) is True
+
+
+def _batched(values: Iterable[Any], size: int) -> Iterator[list[Any]]:
+    """Yield lists of at most *size* values, consuming *values* only once."""
+    iterator = iter(values)
+    while batch_values := list(itertools.islice(iterator, size)):
+        yield batch_values
 
 
 class MapCompose:
@@ -57,11 +110,30 @@ class MapCompose:
     ``__init__`` method keyword arguments are used as default context values.
     See :class:`Compose` processor for more info.
 
+    Functions marked with :func:`batch` are treated as batch processors:
+    instead of being called once per value, they are called once per batch of
+    at most *batch_size* values with the whole batch as a single list. A batch
+    processor returns one entry per input value (``None`` or an empty iterable
+    to filter a value out, a plain value for one output, or an iterable for
+    several outputs), and the outputs are flattened while preserving the input
+    order. Ordinary single-value functions can be freely mixed with batch
+    processors in the same chain.
+
     .. _`parsel selectors`: https://parsel.readthedocs.io/en/latest/parsel.html#parsel.selector.Selector.extract
     """
 
-    def __init__(self, *functions: Callable[..., Any], **default_loader_context: Any):
+    def __init__(
+        self,
+        *functions: Callable[..., Any],
+        batch_size: int = 100,
+        **default_loader_context: Any,
+    ):
+        if batch_size < 1:
+            raise ValueError(
+                f"batch_size must be a positive integer, got {batch_size!r}"
+            )
         self.functions = functions
+        self.batch_size = batch_size
         self.default_loader_context = default_loader_context
 
     def __call__(
@@ -75,6 +147,9 @@ class MapCompose:
             context = self.default_loader_context
         wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
         for func in wrapped_funcs:
+            if _is_batch_processor(func):
+                values = self._run_batch(func, values)
+                continue
             next_values: list[Any] = []
             for v in values:
                 try:
@@ -86,6 +161,33 @@ class MapCompose:
                     ) from e
             values = next_values
         return values
+
+    def _run_batch(
+        self, func: Callable[..., Any], values: Iterable[Any]
+    ) -> list[Any]:
+        next_values: list[Any] = []
+        offset = 0
+        for batch_values in _batched(values, self.batch_size):
+            batch_length = len(batch_values)
+            batch_repr = repr(batch_values)
+            try:
+                results = list(func(batch_values))
+            except Exception as e:
+                raise ValueError(
+                    f"Error in MapCompose batch processor with "
+                    f"{func!s} values={batch_repr} "
+                    f"error='{type(e).__name__}: {e!s}'"
+                ) from e
+            if len(results) != batch_length:
+                raise ValueError(
+                    f"Batch processor {func!s} returned {len(results)} results "
+                    f"for {batch_length} input values at offset {offset}: "
+                    f"{batch_repr}"
+                )
+            offset += batch_length
+            for result in results:
+                next_values += arg_to_iter(result)
+        return next_values
 
 
 class Compose:

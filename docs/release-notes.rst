@@ -5,6 +5,21 @@
 Release notes
 =============
 
+.. _release-unreleased:
+
+itemloaders (unreleased)
+------------------------
+
+-   :class:`~itemloaders.processors.MapCompose` now supports batch processors:
+    functions marked with the new :func:`~itemloaders.processors.batch`
+    decorator are called once per batch of at most ``batch_size`` values
+    (default: 100) instead of once per value, and can be freely mixed with
+    regular per-value functions in the same chain. A batch processor receives
+    a list of values and must return one entry per input value, in order;
+    each entry can be ``None`` or an empty iterable (no output), a plain
+    value (one output) or an iterable of values (several outputs). See
+    :class:`~itemloaders.processors.BatchProcessor`.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)
