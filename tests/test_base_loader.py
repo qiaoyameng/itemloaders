@@ -2,8 +2,9 @@ from functools import partial
 from typing import Any
 
 import pytest
+from parsel import Selector
 
-from itemloaders import ItemLoader
+from itemloaders import DROP, ItemLoader
 from itemloaders.processors import Compose, Identity, Join, MapCompose, TakeFirst
 
 
@@ -471,6 +472,175 @@ class TestItemLoaderBasic:
         assert loader.load_item() == {}
         assert loader.get_output_value("foo") == []
         assert loader.load_item() == {}
+
+
+class TestExplicitDropMode:
+    def test_falsy_values_are_collected(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", [None, "", 0, False, []])
+        assert loader.get_collected_values("f") == [None, "", 0, False, []]
+
+    def test_drop_sentinel_is_not_collected(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", [None, "", 0, False, [], DROP])
+        assert loader.get_collected_values("f") == [None, "", 0, False, []]
+
+    def test_scalar_none_is_data(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", None)
+        assert loader.get_collected_values("f") == [None]
+        assert loader.load_item() == {"f": [None]}
+
+    def test_field_absent_vs_field_none(self):
+        loader = ItemLoader(drop_none=False)
+        assert loader.get_collected_values("f") == []
+        assert "f" not in loader.load_item()
+
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", None)
+        assert loader.get_collected_values("f") == [None]
+        assert loader.load_item() == {"f": [None]}
+
+    def test_drop_sentinel_also_drops_in_legacy_mode(self):
+        loader = ItemLoader()
+        loader.add_value("f", [DROP, 0, False, ""])
+        assert loader.get_collected_values("f") == [0, False, ""]
+
+    def test_legacy_mode_still_drops_scalar_none(self):
+        loader = ItemLoader()
+        loader.add_value("f", None)
+        assert loader.get_collected_values("f") == []
+        assert loader.load_item() == {}
+
+    def test_input_processor_returning_drop(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value(
+            "f", [1, 2, 3], MapCompose(lambda v: DROP if v == 2 else v)
+        )
+        assert loader.get_collected_values("f") == [1, 3]
+
+    def test_input_processor_returning_none_is_data(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value(
+            "f", ["a", "b"], MapCompose(lambda v: None, drop_none=False)
+        )
+        assert loader.get_collected_values("f") == [None, None]
+
+    def test_get_value_drop_short_circuits_processors(self):
+        loader = ItemLoader(drop_none=False)
+        assert loader.get_value("x", lambda v: DROP, str.upper) is DROP
+
+    def test_get_value_none_flows_in_explicit_mode(self):
+        loader = ItemLoader(drop_none=False)
+        assert (
+            loader.get_value(["x"], TakeFirst(drop_none=False), lambda v: None)
+            is None
+        )
+
+    def test_get_value_none_still_stops_in_legacy_mode(self):
+        loader = ItemLoader()
+        assert loader.get_value(None, TakeFirst()) is None
+
+    def test_output_processor_drop_removes_field(self):
+        class MyLoader(ItemLoader):
+            f_out = Compose(lambda vs: DROP)
+
+        loader = MyLoader(drop_none=False)
+        loader.add_value("f", "x")
+        assert loader.load_item() == {}
+        assert loader.get_collected_values("f") == []
+
+    def test_output_processor_none_stores_none(self):
+        class MyLoader(ItemLoader):
+            f_out = Compose(lambda vs: None)
+
+        loader = MyLoader(drop_none=False)
+        loader.add_value("f", "x")
+        assert loader.load_item() == {"f": None}
+        assert loader.get_collected_values("f") == ["x"]
+
+    def test_output_processor_drop_legacy_mode(self):
+        class MyLoader(ItemLoader):
+            f_out = Compose(lambda vs: DROP)
+
+        loader = MyLoader()
+        loader.add_value("f", "x")
+        assert loader.load_item() == {}
+
+    def test_item_and_collected_values_are_consistent(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", [None, "", 0, False, []])
+        assert loader.get_output_value("f") == loader.get_collected_values("f")
+        assert loader.load_item() == {"f": [None, "", 0, False, []]}
+
+    def test_replace_with_drop_discards_old_value(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", "old")
+        loader.replace_value("f", DROP)
+        assert loader.get_collected_values("f") == []
+        assert loader.load_item() == {}
+
+    def test_replace_with_none_replaces_in_explicit_mode(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("f", "old")
+        loader.replace_value("f", None)
+        assert loader.get_collected_values("f") == [None]
+        assert loader.load_item() == {"f": [None]}
+
+    def test_replace_with_none_keeps_old_value_in_legacy_mode(self):
+        loader = ItemLoader()
+        loader.add_value("f", "old")
+        loader.replace_value("f", None)
+        assert loader.get_collected_values("f") == ["old"]
+
+    def test_multi_field_dict_with_none_and_drop(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value(None, {"a": None, "b": DROP, "c": 0})
+        assert loader.get_collected_values("a") == [None]
+        assert loader.get_collected_values("b") == []
+        assert loader.get_collected_values("c") == [0]
+        assert loader.load_item() == {"a": [None], "c": [0]}
+
+    def test_nested_loader_inherits_drop_none_and_does_not_leak_drop(self):
+        selector = Selector(text="<html><body><p>a</p><p>b</p></body></html>")
+        loader = ItemLoader(selector=selector, drop_none=False)
+        nested = loader.nested_xpath("//body")
+        assert nested.drop_none is False
+        nested.add_xpath(
+            "p", "p/text()", MapCompose(lambda v: DROP if v == "b" else v)
+        )
+        assert loader.get_collected_values("p") == ["a"]
+        assert loader.load_item() == {"p": ["a"]}
+
+    def test_nested_loader_can_override_drop_none(self):
+        selector = Selector(text="<html><body><p>a</p></body></html>")
+        loader = ItemLoader(selector=selector, drop_none=False)
+        nested = loader.nested_xpath("//body")
+        nested.drop_none = True
+        nested.add_xpath("p", "p/text()", MapCompose(lambda v: None))
+        assert loader.get_collected_values("p") == []
+
+    def test_output_processor_passing_drop_through_list(self):
+        class MyLoader(ItemLoader):
+            f_out = Identity()
+
+        loader = MyLoader(drop_none=False)
+        loader.add_value("f", ["a", DROP, "b"])
+        assert DROP not in loader.load_item()["f"]
+
+    def test_initial_item_drop_sentinel_is_stripped(self):
+        loader = ItemLoader(item={"f": [DROP, "x"]})
+        assert loader.get_collected_values("f") == ["x"]
+        assert loader.load_item() == {"f": ["x"]}
+
+    def test_replace_drop_in_multi_field_dict_discards_old_value(self):
+        loader = ItemLoader(drop_none=False)
+        loader.add_value("a", "old-a")
+        loader.add_value("b", "old-b")
+        loader.replace_value(None, {"a": DROP, "b": "new-b"})
+        assert loader.get_collected_values("a") == []
+        assert loader.get_collected_values("b") == ["new-b"]
+        assert loader.load_item() == {"b": ["new-b"]}
 
 
 class BaseNoInputReprocessingLoader(ItemLoader):

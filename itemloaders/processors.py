@@ -7,6 +7,7 @@ See documentation in :ref:`declaring-loaders`.
 from __future__ import annotations
 
 from collections import ChainMap
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from itemloaders.common import wrap_loader_context
@@ -14,6 +15,23 @@ from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, MutableMapping
+
+
+class DropMode(str, Enum):
+    """Sentinels that a processor can return to explicitly drop a value.
+
+    Use :data:`DROP` to signal that a value must not be collected nor assigned
+    to the item. Unlike ``None``, which is a regular data value when the
+    loader runs in explicit-drop mode, :data:`DROP` never reaches the
+    collected values or the loaded item.
+    """
+
+    DROP = "drop"
+
+
+#: Return this value from a processor to discard the value explicitly. It is
+#: never collected nor assigned to the item, in either drop mode.
+DROP = DropMode.DROP
 
 
 class MapCompose:
@@ -36,6 +54,13 @@ class MapCompose:
     case the output of that function is ignored for further processing over the
     chain.
 
+    Functions can also return :data:`~itemloaders.processors.DROP` to discard
+    a value explicitly, regardless of the ``drop_none`` setting.
+    :data:`~itemloaders.processors.DROP` values found in the input are
+    skipped without calling any function on them. When ``drop_none=False``
+    is passed, ``None`` results are kept as regular values instead of being
+    ignored, and only :data:`DROP` is discarded.
+
     This processor provides a convenient way to compose functions that only
     work with single values (instead of iterables). For this reason the
     :class:`MapCompose` processor is typically used as input processor, since
@@ -57,17 +82,22 @@ class MapCompose:
     ``__init__`` method keyword arguments are used as default context values.
     See :class:`Compose` processor for more info.
 
+    .. versionchanged:: VERSION
+        Added support for the :data:`~itemloaders.processors.DROP` sentinel
+        and the ``drop_none`` keyword argument.
+
     .. _`parsel selectors`: https://parsel.readthedocs.io/en/latest/parsel.html#parsel.selector.Selector.extract
     """
 
     def __init__(self, *functions: Callable[..., Any], **default_loader_context: Any):
         self.functions = functions
+        self.drop_none = default_loader_context.get("drop_none", True)
         self.default_loader_context = default_loader_context
 
     def __call__(
         self, value: Any, loader_context: MutableMapping[str, Any] | None = None
     ) -> Iterable[Any]:
-        values = arg_to_iter(value)
+        values = [v for v in arg_to_iter(value) if v is not DROP]
         context: MutableMapping[str, Any]
         if loader_context:
             context = ChainMap(loader_context, self.default_loader_context)
@@ -78,12 +108,18 @@ class MapCompose:
             next_values: list[Any] = []
             for v in values:
                 try:
-                    next_values += arg_to_iter(func(v))
+                    result = func(v)
                 except Exception as e:
                     raise ValueError(
                         f"Error in MapCompose with "
                         f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
                     ) from e
+                if result is DROP:
+                    continue
+                if result is None and not self.drop_none:
+                    next_values.append(None)
+                else:
+                    next_values += arg_to_iter(result)
             values = next_values
         return values
 
@@ -98,6 +134,12 @@ class Compose:
 
     By default, stop process on ``None`` value. This behaviour can be changed by
     passing keyword argument ``stop_on_none=False``.
+
+    If a function returns :data:`~itemloaders.processors.DROP`, the whole
+    composition stops and :data:`~itemloaders.processors.DROP` is returned,
+    regardless of the ``stop_on_none`` setting. Pass ``drop_none=False`` to
+    make ``None`` a regular value that keeps flowing through the remaining
+    functions.
 
     Example:
 
@@ -115,11 +157,16 @@ class Compose:
     Loader context values passed to functions are overridden with the currently
     active Loader context accessible through the :attr:`ItemLoader.context
     <itemloaders.ItemLoader.context>` attribute.
+
+    .. versionchanged:: VERSION
+        Added support for the :data:`~itemloaders.processors.DROP` sentinel
+        and the ``drop_none`` keyword argument.
     """
 
     def __init__(self, *functions: Callable[..., Any], **default_loader_context: Any):
         self.functions = functions
         self.stop_on_none = default_loader_context.get("stop_on_none", True)
+        self.drop_none = default_loader_context.get("drop_none", True)
         self.default_loader_context = default_loader_context
 
     def __call__(
@@ -132,7 +179,9 @@ class Compose:
             context = self.default_loader_context
         wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
         for func in wrapped_funcs:
-            if value is None and self.stop_on_none:
+            if value is DROP:
+                break
+            if value is None and self.drop_none and self.stop_on_none:
                 break
             try:
                 value = func(value)
@@ -156,10 +205,26 @@ class TakeFirst:
     >>> proc = TakeFirst()
     >>> proc(['', 'one', 'two', 'three'])
     'one'
+
+    :data:`~itemloaders.processors.DROP` entries are always skipped. When
+    ``drop_none=False`` is passed, ``None`` is considered a regular value and
+    can be returned, so a field explicitly set to ``None`` stays
+    distinguishable from a field with no value at all.
+
+    .. versionchanged:: VERSION
+        Added support for the :data:`~itemloaders.processors.DROP` sentinel
+        and the ``drop_none`` keyword argument.
     """
+
+    def __init__(self, *, drop_none: bool = True):
+        self.drop_none = drop_none
 
     def __call__(self, values: Any) -> Any:
         for value in values:
+            if value is DROP:
+                continue
+            if value is None and not self.drop_none:
+                return None
             if value is not None and value != "":
                 return value
         return None

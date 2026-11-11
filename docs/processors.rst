@@ -95,3 +95,69 @@ item types where unassigned fields are absent, such as :class:`dict` or
 For a field to be present regardless of what is collected, use an item class
 that gives its fields a default value, such as a :mod:`dataclasses` or
 ``attrs`` class.
+
+.. _explicit-drop:
+
+Explicit dropping with ``DROP``
+-------------------------------
+
+Sometimes an API explicitly returns ``None``, and that ``None`` must be
+stored rather than confused with a value that was never extracted. Pass
+``drop_none=False`` when creating the loader to switch to explicit-drop mode:
+in that mode ``None``, ``""``, ``0`` and ``False`` are ordinary data values
+that are collected and assigned to the item, while
+:data:`~itemloaders.processors.DROP` is the only signal that a value must be
+discarded::
+
+    from itemloaders import DROP, ItemLoader
+    from itemloaders.processors import MapCompose
+
+    l = ItemLoader(drop_none=False)
+    l.add_value("name", [None, "", 0, False])
+    l.add_value(
+        "price",
+        ["12", DROP],
+        MapCompose(int, lambda v: DROP if v > 100 else v),
+    )
+    l.load_item()
+    # {'name': [None, '', 0, False], 'price': [12]}
+
+With the default ``drop_none=True``, ``None`` keeps being ignored as before,
+but :data:`~itemloaders.processors.DROP` is still honored, so processors can
+drop values explicitly in either mode. The distinction between a field with
+no value at all and a field whose value is ``None`` is then preserved::
+
+    l = ItemLoader(drop_none=False)
+    l.add_value("name", None)
+    l.load_item()
+    # {'name': [None]}
+    l.get_collected_values("name")
+    # [None]
+    l.get_collected_values("missing")
+    # []
+
+The contract runs through the whole pipeline:
+
+- :class:`~itemloaders.processors.MapCompose` drops the values for which a
+  function returns :data:`~itemloaders.processors.DROP`, and keeps ``None``
+  values when built with ``MapCompose(..., drop_none=False)``.
+- :class:`~itemloaders.processors.Compose` stops the chain as soon as a
+  function returns :data:`~itemloaders.processors.DROP`, and lets ``None``
+  flow through the remaining functions with ``drop_none=False``.
+- :class:`~itemloaders.processors.TakeFirst` always skips
+  :data:`~itemloaders.processors.DROP`, and can return ``None`` when built
+  with ``TakeFirst(drop_none=False)``.
+- :meth:`~ItemLoader.replace_value` discards the data collected so far for a
+  field when given :data:`~itemloaders.processors.DROP`. With
+  ``drop_none=False``, replacing with ``None`` stores ``None`` like any other
+  value; with the default mode the previous data is kept, as before.
+- A field whose output processor returns
+  :data:`~itemloaders.processors.DROP` is absent from the loaded item, and
+  :data:`~itemloaders.processors.DROP` never appears inside the item even if
+  an output processor passes it through in a list.
+
+Nested loaders inherit the ``drop_none`` setting of their parent.
+
+.. versionadded:: VERSION
+    The :data:`~itemloaders.processors.DROP` sentinel and the ``drop_none``
+    parameter.

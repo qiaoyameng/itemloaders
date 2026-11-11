@@ -5,6 +5,23 @@
 Release notes
 =============
 
+.. _release-VERSION:
+
+itemloaders VERSION (unreleased)
+--------------------------------
+
+-   Added explicit-drop mode. Processors can now return the new
+    :data:`~itemloaders.processors.DROP` sentinel to discard a value
+    explicitly, and passing ``drop_none=False`` to
+    :class:`~itemloaders.ItemLoader` makes ``None`` (as well as ``""``,
+    ``0`` and ``False``) a regular data value that is collected and assigned
+    to the item, so an explicit ``None`` from an API is no longer confused
+    with a missing value. :class:`~itemloaders.processors.MapCompose`,
+    :class:`~itemloaders.processors.Compose` and
+    :class:`~itemloaders.processors.TakeFirst` also accept a ``drop_none``
+    keyword argument. The default behavior is unchanged. See
+    :ref:`explicit-drop`.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)

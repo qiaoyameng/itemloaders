@@ -14,7 +14,7 @@ from parsel import Selector  # noqa: TC002  # for sphinx
 from parsel.utils import extract_regex, flatten
 
 from itemloaders.common import wrap_loader_context
-from itemloaders.processors import Identity
+from itemloaders.processors import DROP, Identity
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
@@ -62,6 +62,23 @@ class ItemLoader:
 
     Pass *stats* to keep track of which parsing rules are being used, as
     described in :ref:`rule-usage`.
+
+    Pass ``drop_none=False`` to enable explicit-drop mode. In that mode
+    ``None``, ``""``, ``0`` and ``False`` are ordinary data values that get
+    collected and assigned to the item, while a processor returns
+    :data:`~itemloaders.processors.DROP` to discard a value explicitly. The
+    default ``drop_none=True`` keeps the legacy behavior where ``None`` is
+    ignored. Nested loaders inherit this setting. See :ref:`empty-values`.
+
+    .. versionchanged:: VERSION
+        Added the ``drop_none`` parameter and support for the
+        :data:`~itemloaders.processors.DROP` sentinel.
+
+    .. attribute:: drop_none
+
+        Whether ``None`` results are dropped (``True``, the legacy behavior)
+        or collected as regular values (``False``, explicit-drop mode). The
+        :data:`~itemloaders.processors.DROP` sentinel is dropped either way.
 
     .. attribute:: item
 
@@ -125,12 +142,17 @@ class ItemLoader:
         selector: Selector | None = None,
         parent: ItemLoader | None = None,
         stats: _StatsCollector | None = None,
+        drop_none: bool | None = None,
         **context: Any,
     ):
         self.selector: Selector | None = selector
         self.stats: _StatsCollector | None = (
             stats if stats is not None or parent is None else parent.stats
         )
+        if drop_none is None:
+            self.drop_none: bool = True if parent is None else parent.drop_none
+        else:
+            self.drop_none = drop_none
         context.update(selector=selector)
         # An item built here has no data, only the field defaults of its class,
         # which must not be mistaken for loaded values.
@@ -145,7 +167,9 @@ class ItemLoader:
         if has_initial_values:
             for field_name, value in ItemAdapter(item).items():
                 self._values.setdefault(field_name, [])
-                self._values[field_name] += arg_to_iter(value)
+                self._values[field_name] += [
+                    v for v in arg_to_iter(value) if v is not DROP
+                ]
 
     @property
     def _values(self) -> dict[str, list[Any]]:
@@ -215,6 +239,10 @@ class ItemLoader:
         multiple fields may be added. And the processed value should be a dict
         with field_name mapped to values.
 
+        Nothing is collected when the processed value is
+        :data:`~itemloaders.processors.DROP`, or when it is ``None`` and the
+        loader drops ``None`` values (see :attr:`drop_none`).
+
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
 
@@ -228,7 +256,7 @@ class ItemLoader:
 
         """
         value = self.get_value(value, *processors, re=re, **kw)
-        if value is None:
+        if value is DROP or (value is None and self.drop_none):
             return self
         if not field_name:
             for k, v in value.items():
@@ -249,11 +277,22 @@ class ItemLoader:
         Similar to :meth:`add_value` but replaces the collected data with the
         new value instead of adding it.
 
+        If the processed value is :data:`~itemloaders.processors.DROP`, the
+        data collected so far for the field is discarded and nothing is
+        collected instead. If it is ``None``, the collected data is kept
+        untouched (the legacy behavior), unless the loader runs with
+        :attr:`drop_none` set to ``False``, in which case ``None`` replaces
+        the collected data like any other value.
+
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
         """
         value = self.get_value(value, *processors, re=re, **kw)
-        if value is None:
+        if value is DROP:
+            if field_name:
+                self._values.pop(field_name, None)
+            return self
+        if value is None and self.drop_none:
             return self
         if not field_name:
             for k, v in value.items():
@@ -263,11 +302,25 @@ class ItemLoader:
         return self
 
     def _add_value(self, field_name: str, value: Any) -> None:
-        value = arg_to_iter(value)
+        if value is DROP:
+            return
+        if value is None and not self.drop_none:
+            # None is data in explicit-drop mode: collect it as a single value.
+            value = [None]
+        else:
+            value = arg_to_iter(value)
         processed_value = self._process_input_value(field_name, value)
-        if processed_value:
+        if processed_value is DROP:
+            return
+        if processed_value is None and not self.drop_none:
+            processed_iter: list[Any] = [None]
+        else:
+            processed_iter = [
+                v for v in arg_to_iter(processed_value) if v is not DROP
+            ]
+        if processed_iter:
             self._values.setdefault(field_name, [])
-            self._values[field_name] += arg_to_iter(processed_value)
+            self._values[field_name] += processed_iter
 
     def _replace_value(self, field_name: str, value: Any) -> None:
         self._values.pop(field_name, None)
@@ -291,6 +344,10 @@ class ItemLoader:
             applied before processors
         :type re: str or typing.Pattern[str]
 
+        Processing stops early when a processor returns
+        :data:`~itemloaders.processors.DROP`, or when it returns ``None`` and
+        the loader drops ``None`` values (see :attr:`drop_none`).
+
         Examples:
 
         >>> from itemloaders import ItemLoader
@@ -304,7 +361,9 @@ class ItemLoader:
             value = flatten(extract_regex(re, x) for x in value)
 
         for proc in processors:
-            if value is None:
+            if value is DROP:
+                break
+            if value is None and self.drop_none:
                 break
             _proc = proc
             proc = wrap_loader_context(proc, self.context)  # noqa: PLW2901
@@ -322,12 +381,26 @@ class ItemLoader:
         Populate the item with the data collected so far, and return it. The
         data collected is first passed through the :ref:`output processors
         <processors>` to get the final value to assign to each item field.
+
+        Fields whose output processor returns
+        :data:`~itemloaders.processors.DROP` are skipped and removed from the
+        collected data, and ``None`` results are skipped only when the loader
+        drops ``None`` values (see :attr:`drop_none`). Any other value,
+        including ``None`` in explicit-drop mode, is assigned to the item.
         """
         adapter = ItemAdapter(self.item)
         for field_name in tuple(self._values):
             value = self.get_output_value(field_name)
-            if value is not None:
-                adapter[field_name] = value
+            if value is DROP:
+                self._values.pop(field_name, None)
+                continue
+            if isinstance(value, list):
+                # DROP is a control sentinel and can never reach the item,
+                # even when an output processor passes it through in a list.
+                value = [v for v in value if v is not DROP]
+            if value is None and self.drop_none:
+                continue
+            adapter[field_name] = value
 
         return adapter.item
 
