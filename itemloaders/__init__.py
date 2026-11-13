@@ -26,6 +26,19 @@ class _StatsCollector(Protocol):
     def inc_value(self, key: str, count: int = 1) -> None: ...
 
 
+#: Valid values for :attr:`ItemLoader.record_cardinality` entries.
+RECORD_CARDINALITIES = ("one", "optional", "many")
+
+
+class RecordCardinalityError(ValueError):
+    """
+    Raised when the values collected for a record violate the cardinality
+    declared for a field in :attr:`ItemLoader.record_cardinality`.
+
+    The error message always identifies the offending record and field.
+    """
+
+
 def unbound_method(method: Callable[..., Any]) -> Callable[..., Any]:
     """
     Allow to use single-argument functions as input or output processors
@@ -112,12 +125,28 @@ class ItemLoader:
         It's the selector given in the ``__init__`` method.
         This attribute is meant to be read-only.
 
+    .. attribute:: record_cardinality
+
+        A dict mapping field names to cardinality rules, used by
+        :ref:`record mode <record-mode>` to validate the values collected
+        for each record. Supported rules:
+
+        -   ``"one"``: exactly one non-empty value must be collected.
+        -   ``"optional"``: at most one value may be collected.
+        -   ``"many"``: any number of values may be collected.
+
+        Fields not declared are not validated. Violations raise
+        :class:`RecordCardinalityError` identifying the record and field.
+
+        .. versionadded:: VERSION
+
     .. _parsel: https://parsel.readthedocs.io/en/latest/
     """
 
     default_item_class: type = dict
     default_input_processor: Callable[..., Any] = Identity()
     default_output_processor: Callable[..., Any] = Identity()
+    record_cardinality: dict[str, str] = {}
 
     def __init__(
         self,
@@ -142,6 +171,7 @@ class ItemLoader:
         self.context: MutableMapping[str, Any] = context
         self.parent: ItemLoader | None = parent
         self._local_values: dict[str, list[Any]] = {}
+        self._local_records: dict[Any, dict[str, list[Any]]] = {}
         if has_initial_values:
             for field_name, value in ItemAdapter(item).items():
                 self._values.setdefault(field_name, [])
@@ -152,6 +182,12 @@ class ItemLoader:
         if self.parent is not None:
             return self.parent._values
         return self._local_values
+
+    @property
+    def _records(self) -> dict[Any, dict[str, list[Any]]]:
+        if self.parent is not None:
+            return self.parent._records
+        return self._local_records
 
     @property
     def item(self) -> Any:
@@ -200,6 +236,7 @@ class ItemLoader:
         value: Any,
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -214,6 +251,10 @@ class ItemLoader:
         The given ``field_name`` can be ``None``, in which case values for
         multiple fields may be added. And the processed value should be a dict
         with field_name mapped to values.
+
+        When ``record_id`` is given, the processed values are attributed to
+        the record identified by it (see :ref:`record-mode`), instead of the
+        loader-wide value collection.
 
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
@@ -232,9 +273,9 @@ class ItemLoader:
             return self
         if not field_name:
             for k, v in value.items():
-                self._add_value(k, v)
+                self._dispatch_add_value(record_id, k, v)
         else:
-            self._add_value(field_name, value)
+            self._dispatch_add_value(record_id, field_name, value)
         return self
 
     def replace_value(
@@ -243,11 +284,15 @@ class ItemLoader:
         value: Any,
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
         Similar to :meth:`add_value` but replaces the collected data with the
         new value instead of adding it.
+
+        When ``record_id`` is given, only the data collected for that record
+        is replaced; other records are left untouched.
 
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
@@ -257,10 +302,26 @@ class ItemLoader:
             return self
         if not field_name:
             for k, v in value.items():
-                self._replace_value(k, v)
+                self._dispatch_replace_value(record_id, k, v)
         else:
-            self._replace_value(field_name, value)
+            self._dispatch_replace_value(record_id, field_name, value)
         return self
+
+    def _dispatch_add_value(
+        self, record_id: Any, field_name: str, value: Any
+    ) -> None:
+        if record_id is None:
+            self._add_value(field_name, value)
+        else:
+            self._add_record_value(record_id, field_name, value)
+
+    def _dispatch_replace_value(
+        self, record_id: Any, field_name: str, value: Any
+    ) -> None:
+        if record_id is None:
+            self._replace_value(field_name, value)
+        else:
+            self._replace_record_value(record_id, field_name, value)
 
     def _add_value(self, field_name: str, value: Any) -> None:
         value = arg_to_iter(value)
@@ -272,6 +333,50 @@ class ItemLoader:
     def _replace_value(self, field_name: str, value: Any) -> None:
         self._values.pop(field_name, None)
         self._add_value(field_name, value)
+
+    def _add_record_value(self, record_id: Any, field_name: str, value: Any) -> None:
+        value = arg_to_iter(value)
+        processed_value = self._process_input_value(field_name, value)
+        if processed_value:
+            record = self._records.setdefault(record_id, {})
+            record.setdefault(field_name, [])
+            record[field_name] += arg_to_iter(processed_value)
+
+    def _replace_record_value(
+        self, record_id: Any, field_name: str, value: Any
+    ) -> None:
+        record = self._records.get(record_id)
+        if record is not None:
+            record.pop(field_name, None)
+        self._add_record_value(record_id, field_name, value)
+
+    def add_record_values(
+        self,
+        entries: Iterable[tuple[Any, str, Any]],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """
+        Batch version of :meth:`add_value` for :ref:`record mode
+        <record-mode>`.
+
+        *entries* is an iterable of ``(record_id, field_name, value)``
+        tuples. Each entry is processed exactly as if
+        ``add_value(field_name, value, record_id=record_id)`` had been
+        called, in order, so feeding the same entries one by one or through
+        this method yields the same records.
+
+        :returns: The current ItemLoader instance for method chaining.
+        :rtype: ItemLoader
+
+        .. versionadded:: VERSION
+        """
+        for record_id, field_name, value in entries:
+            self.add_value(
+                field_name, value, *processors, re=re, record_id=record_id, **kw
+            )
+        return self
 
     def get_value(
         self,
@@ -351,6 +456,100 @@ class ItemLoader:
         """Return the collected values for the given field."""
         return self._values.get(field_name, [])
 
+    def load_records(self) -> list[Any]:
+        """
+        Populate one item per record collected through the ``record_id``
+        parameter of :meth:`add_value` and related methods, and return them
+        as a list, ordered by first use of each record id.
+
+        Before populating items, the values collected for every record are
+        validated against :attr:`record_cardinality`; violations raise
+        :class:`RecordCardinalityError`. Multi-valued fields are kept as
+        collected within their own record; values from different fields are
+        never combined into a Cartesian product of records.
+
+        .. versionadded:: VERSION
+        """
+        return [self.load_record(record_id) for record_id in self._records]
+
+    def load_record(self, record_id: Any) -> Any:
+        """
+        Populate a new item with the data collected for the given record,
+        and return it. The data collected is first validated against
+        :attr:`record_cardinality` and then passed through the
+        :ref:`output processors <processors>` of each field.
+
+        .. versionadded:: VERSION
+        """
+        if record_id not in self._records:
+            raise KeyError(f"Unknown record: {record_id!r}")
+        record = self._records[record_id]
+        self._check_record_cardinality(record_id, record)
+        try:
+            item = self.item.__class__()
+        except TypeError:
+            item = self.default_item_class()
+        adapter = ItemAdapter(item)
+        for field_name in tuple(record):
+            value = self._get_record_output_value(record_id, field_name)
+            if value is not None:
+                adapter[field_name] = value
+        return adapter.item
+
+    def _check_record_cardinality(
+        self, record_id: Any, record: dict[str, list[Any]]
+    ) -> None:
+        for field_name, rule in self.record_cardinality.items():
+            if rule not in RECORD_CARDINALITIES:
+                raise ValueError(
+                    f"Invalid record cardinality rule: field={field_name!r} "
+                    f"rule={rule!r} (expected one of {RECORD_CARDINALITIES!r})"
+                )
+            values = record.get(field_name, [])
+            if rule == "many":
+                continue
+            if not values:
+                if rule == "one":
+                    raise RecordCardinalityError(
+                        f"Missing value: record={record_id!r} "
+                        f"field={field_name!r} requires exactly 1 value, got 0"
+                    )
+                continue
+            if len(values) > 1:
+                raise RecordCardinalityError(
+                    f"Too many values: record={record_id!r} "
+                    f"field={field_name!r} allows at most 1 value, "
+                    f"got {len(values)}: {values!r}"
+                )
+            if rule == "one" and (values[0] is None or values[0] == ""):
+                raise RecordCardinalityError(
+                    f"Empty value: record={record_id!r} "
+                    f"field={field_name!r} requires a non-empty value, "
+                    f"got {values[0]!r}"
+                )
+
+    def _get_record_output_value(self, record_id: Any, field_name: str) -> Any:
+        proc = self.get_output_processor(field_name)
+        proc = wrap_loader_context(proc, self.context)
+        value = self._records[record_id].get(field_name, [])
+        try:
+            return proc(value)
+        except Exception as e:
+            raise ValueError(
+                f"Error with output processor: record={record_id!r} "
+                f"field={field_name!r} value={value!r} "
+                f"error='{type(e).__name__}: {e!s}'"
+            ) from e
+
+    def get_record_collected_values(
+        self, record_id: Any, field_name: str
+    ) -> list[Any]:
+        """Return the collected values for the given record and field.
+
+        .. versionadded:: VERSION
+        """
+        return self._records.get(record_id, {}).get(field_name, [])
+
     def get_input_processor(self, field_name: str) -> Callable[..., Any]:
         proc = getattr(self, f"{field_name}_in", None)
         if not proc:
@@ -406,6 +605,7 @@ class ItemLoader:
         xpath: str | Iterable[str],
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -430,7 +630,9 @@ class ItemLoader:
 
         """
         values = self._get_xpathvalues(xpath, field_name, **kw)
-        return self.add_value(field_name, values, *processors, re=re, **kw)
+        return self.add_value(
+            field_name, values, *processors, re=re, record_id=record_id, **kw
+        )
 
     def replace_xpath(
         self,
@@ -438,6 +640,7 @@ class ItemLoader:
         xpath: str | Iterable[str],
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -448,7 +651,9 @@ class ItemLoader:
 
         """
         values = self._get_xpathvalues(xpath, field_name, **kw)
-        return self.replace_value(field_name, values, *processors, re=re, **kw)
+        return self.replace_value(
+            field_name, values, *processors, re=re, record_id=record_id, **kw
+        )
 
     def get_xpath(
         self,
@@ -501,6 +706,7 @@ class ItemLoader:
         css: str | Iterable[str],
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -525,7 +731,9 @@ class ItemLoader:
 
         """
         values = self._get_cssvalues(css, field_name)
-        return self.add_value(field_name, values, *processors, re=re, **kw)
+        return self.add_value(
+            field_name, values, *processors, re=re, record_id=record_id, **kw
+        )
 
     def replace_css(
         self,
@@ -533,6 +741,7 @@ class ItemLoader:
         css: str | Iterable[str],
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -543,7 +752,9 @@ class ItemLoader:
 
         """
         values = self._get_cssvalues(css, field_name)
-        return self.replace_value(field_name, values, *processors, re=re, **kw)
+        return self.replace_value(
+            field_name, values, *processors, re=re, record_id=record_id, **kw
+        )
 
     def get_css(
         self,
@@ -590,6 +801,7 @@ class ItemLoader:
         jmes: str | Iterable[str],
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -613,7 +825,9 @@ class ItemLoader:
             loader.add_jmes('price', 'price', TakeFirst(), re='the price is (.*)')
         """
         values = self._get_jmesvalues(jmes, field_name)
-        return self.add_value(field_name, values, *processors, re=re, **kw)
+        return self.add_value(
+            field_name, values, *processors, re=re, record_id=record_id, **kw
+        )
 
     def replace_jmes(
         self,
@@ -621,6 +835,7 @@ class ItemLoader:
         jmes: str | Iterable[str],
         *processors: Callable[..., Any],
         re: str | Pattern[str] | None = None,
+        record_id: Any = None,
         **kw: Any,
     ) -> Self:
         """
@@ -630,7 +845,9 @@ class ItemLoader:
         :rtype: ItemLoader
         """
         values = self._get_jmesvalues(jmes, field_name)
-        return self.replace_value(field_name, values, *processors, re=re, **kw)
+        return self.replace_value(
+            field_name, values, *processors, re=re, record_id=record_id, **kw
+        )
 
     def get_jmes(
         self,

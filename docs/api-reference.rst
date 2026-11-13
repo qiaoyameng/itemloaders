@@ -5,3 +5,5 @@ API Reference
 
 .. autoclass:: itemloaders.ItemLoader
     :members:
+
+.. autoexception:: itemloaders.RecordCardinalityError
