@@ -7,6 +7,7 @@ See documentation in :ref:`declaring-loaders`.
 from __future__ import annotations
 
 from collections import ChainMap
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from itemloaders.common import wrap_loader_context
@@ -14,6 +15,62 @@ from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, MutableMapping
+
+
+class BatchProcessor:
+    """
+    Wraps a callable so that :class:`MapCompose` applies it to batches of
+    values instead of to one value at a time.
+
+    The wrapped callable receives a list of at most ``batch_size`` values and
+    must return one result per input value, as an iterable of the same
+    length. Each result is then flattened like the return value of a regular
+    :class:`MapCompose` function: ``None`` produces no output value, a single
+    value produces one output value, and an iterable produces multiple output
+    values. Output values keep the order of the input values.
+
+    The input iterable is consumed only once, in a single pass, and each
+    batch is processed by an independent call: no state is shared between
+    batches by this wrapper, so the wrapped callable must not rely on
+    previous batches either.
+
+    If the callable raises, or returns a number of results different from the
+    number of input values in the batch, :class:`MapCompose` raises a
+    :exc:`ValueError` reporting the processor and the input positions of the
+    offending batch, and produces no partial output for that call.
+
+    Example:
+
+    >>> def uppercase_batch(values):
+    ...     return [v.upper() for v in values]
+    ...
+    >>> from itemloaders.processors import BatchProcessor, MapCompose
+    >>> proc = MapCompose(BatchProcessor(uppercase_batch, batch_size=2))
+    >>> proc(['hello', 'world', 'scrapy'])
+    ['HELLO', 'WORLD', 'SCRAPY']
+    """
+
+    def __init__(self, function: Callable[..., Any], batch_size: int = 100):
+        if not callable(function):
+            raise TypeError(
+                f"BatchProcessor expects a callable, got {type(function).__name__!r}"
+            )
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError(
+                f"batch_size must be an integer, got {type(batch_size).__name__!r}"
+            )
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
+        self.function = function
+        self.batch_size = batch_size
+
+    def __call__(self, values: Any) -> Any:
+        return self.function(values)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self.function!r}, batch_size={self.batch_size})"
+
+    __str__ = __repr__
 
 
 class MapCompose:
@@ -53,6 +110,17 @@ class MapCompose:
     >>> proc(['hello', 'world', 'this', 'is', 'something'])
     ['HELLO', 'THIS', 'IS', 'SOMETHING']
 
+    Functions wrapped in :class:`BatchProcessor` are applied to batches of
+    values instead of single values, and can be freely mixed with regular
+    per-value functions, which do not need any signature change:
+
+    >>> def upper_batch(values):
+    ...     return [v.upper() for v in values]
+    ...
+    >>> proc = MapCompose(filter_world, BatchProcessor(upper_batch, batch_size=2))
+    >>> proc(['hello', 'world', 'this'])
+    ['HELLO', 'THIS']
+
     As with the Compose processor, functions can receive Loader contexts, and
     ``__init__`` method keyword arguments are used as default context values.
     See :class:`Compose` processor for more info.
@@ -73,8 +141,11 @@ class MapCompose:
             context = ChainMap(loader_context, self.default_loader_context)
         else:
             context = self.default_loader_context
-        wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
-        for func in wrapped_funcs:
+        for func in self.functions:
+            if isinstance(func, BatchProcessor):
+                values = self._process_batches(func, values, context, value)
+                continue
+            func = wrap_loader_context(func, context)
             next_values: list[Any] = []
             for v in values:
                 try:
@@ -86,6 +157,51 @@ class MapCompose:
                     ) from e
             values = next_values
         return values
+
+    @staticmethod
+    def _process_batches(
+        processor: BatchProcessor,
+        values: Iterable[Any],
+        context: MutableMapping[str, Any],
+        original_value: Any,
+    ) -> list[Any]:
+        func = wrap_loader_context(processor.function, context)
+        next_values: list[Any] = []
+        position = 0
+        iterator = iter(values)
+        while True:
+            batch = list(islice(iterator, processor.batch_size))
+            if not batch:
+                break
+            try:
+                results = func(batch)
+            except Exception as e:
+                raise ValueError(
+                    f"Error in MapCompose with "
+                    f"{processor!s} value={original_value!r} "
+                    f"error='{type(e).__name__}: {e!s}'"
+                ) from e
+            try:
+                results = list(results)
+            except TypeError as e:
+                raise ValueError(
+                    f"Error in MapCompose with {processor!s}: batch processor "
+                    f"returned a non-iterable result for the batch of "
+                    f"{len(batch)} input values at positions "
+                    f"{position}-{position + len(batch) - 1}"
+                ) from e
+            if len(results) != len(batch):
+                raise ValueError(
+                    f"Error in MapCompose with {processor!s}: batch processor "
+                    f"returned {len(results)} results for {len(batch)} input "
+                    f"values at positions {position}-{position + len(batch) - 1}"
+                )
+            batch_values: list[Any] = []
+            for result in results:
+                batch_values += arg_to_iter(result)
+            next_values += batch_values
+            position += len(batch)
+        return next_values
 
 
 class Compose:
