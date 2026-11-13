@@ -10,10 +10,15 @@ from collections import ChainMap
 from typing import TYPE_CHECKING, Any
 
 from itemloaders.common import wrap_loader_context
-from itemloaders.utils import arg_to_iter
+from itemloaders.drop import DROP, EXPLICIT_DROP_CONTEXT_KEY
+from itemloaders.utils import arg_to_iter, explicit_arg_to_iter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, MutableMapping
+
+
+def _explicit_drop(loader_context: MutableMapping[str, Any] | None) -> bool:
+    return bool(loader_context and loader_context.get(EXPLICIT_DROP_CONTEXT_KEY))
 
 
 class MapCompose:
@@ -34,7 +39,11 @@ class MapCompose:
     flattened with the list of values returned by the same function applied to
     the other input values. The functions can also return ``None`` in which
     case the output of that function is ignored for further processing over the
-    chain.
+    chain. Returning :data:`~itemloaders.DROP` always drops the value, in any
+    mode. When the processor runs in explicit drop mode (see
+    :class:`~itemloaders.ItemLoader`), ``None`` is a regular value instead and
+    is kept for the rest of the chain; only :data:`~itemloaders.DROP` drops a
+    value.
 
     This processor provides a convenient way to compose functions that only
     work with single values (instead of iterables). For this reason the
@@ -74,16 +83,30 @@ class MapCompose:
         else:
             context = self.default_loader_context
         wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
+        explicit_drop = _explicit_drop(context)
         for func in wrapped_funcs:
             next_values: list[Any] = []
+            dropped_any = False
             for v in values:
+                if v is DROP:
+                    dropped_any = True
+                    continue
                 try:
-                    next_values += arg_to_iter(func(v))
+                    result = func(v)
                 except Exception as e:
                     raise ValueError(
                         f"Error in MapCompose with "
                         f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
                     ) from e
+                if result is DROP:
+                    dropped_any = True
+                    continue
+                if explicit_drop:
+                    next_values += explicit_arg_to_iter(result)
+                else:
+                    next_values += arg_to_iter(result)
+            if explicit_drop and dropped_any and not next_values:
+                return DROP
             values = next_values
         return values
 
@@ -97,7 +120,10 @@ class Compose:
     this processor.
 
     By default, stop process on ``None`` value. This behaviour can be changed by
-    passing keyword argument ``stop_on_none=False``.
+    passing keyword argument ``stop_on_none=False``. In explicit drop mode
+    (see :class:`~itemloaders.ItemLoader`) ``None`` never stops the chain,
+    since it is treated as data; only :data:`~itemloaders.DROP` short-circuits
+    the chain and is returned as the processor result.
 
     Example:
 
@@ -131,8 +157,11 @@ class Compose:
         else:
             context = self.default_loader_context
         wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
+        explicit_drop = _explicit_drop(context)
         for func in wrapped_funcs:
-            if value is None and self.stop_on_none:
+            if value is DROP:
+                break
+            if value is None and self.stop_on_none and not explicit_drop:
                 break
             try:
                 value = func(value)
@@ -148,7 +177,7 @@ class TakeFirst:
     """
     Returns the first non-null/non-empty value from the values received,
     so it's typically used as an output processor to single-valued fields.
-    It doesn't receive any ``__init__`` method arguments, nor does it accept Loader contexts.
+    It doesn't accept Loader contexts by default.
 
     Example:
 
@@ -156,9 +185,40 @@ class TakeFirst:
     >>> proc = TakeFirst()
     >>> proc(['', 'one', 'two', 'three'])
     'one'
+
+    Pass ``explicit_drop=True`` at instantiation, or run the processor inside
+    an :class:`~itemloaders.ItemLoader` created with ``explicit_drop=True``,
+    to use the explicit drop contract: the first value is returned no matter
+    what it is (including ``None``, an empty string, ``0`` or ``False``),
+    :data:`~itemloaders.DROP` entries are skipped, and :data:`~itemloaders.DROP`
+    is returned when no value remains, so an empty input stays distinguishable
+    from an input whose value is ``None``.
+
+    >>> from itemloaders import DROP
+    >>> proc = TakeFirst(explicit_drop=True)
+    >>> proc([None, '', 0, False])
+    >>> proc([DROP, 'one'])
+    'one'
+    >>> proc([])
+    DROP
     """
 
-    def __call__(self, values: Any) -> Any:
+    def __init__(self, explicit_drop: bool = False):
+        self.explicit_drop = explicit_drop
+
+    def __call__(
+        self,
+        values: Any,
+        loader_context: MutableMapping[str, Any] | None = None,
+    ) -> Any:
+        explicit_drop = self.explicit_drop
+        if loader_context and EXPLICIT_DROP_CONTEXT_KEY in loader_context:
+            explicit_drop = bool(loader_context[EXPLICIT_DROP_CONTEXT_KEY])
+        if explicit_drop:
+            for value in values:
+                if value is not DROP:
+                    return value
+            return DROP
         for value in values:
             if value is not None and value != "":
                 return value

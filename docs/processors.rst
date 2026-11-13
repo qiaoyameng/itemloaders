@@ -95,3 +95,54 @@ item types where unassigned fields are absent, such as :class:`dict` or
 For a field to be present regardless of what is collected, use an item class
 that gives its fields a default value, such as a :mod:`dataclasses` or
 ``attrs`` class.
+
+.. _explicit-drop:
+
+Explicit drop mode
+-------------------
+
+The historical behaviour conflates ``None`` with "no value was found": both
+are ignored. When an API explicitly returns ``None`` as data and that ``None``
+must be stored, create the loader with ``explicit_drop=True``::
+
+    from itemloaders import DROP, ItemLoader
+
+    loader = ItemLoader(explicit_drop=True)
+    loader.add_value('field', [None, '', 0, False, []])
+    loader.load_item()
+    # {'field': [None, '', 0, False, []]}
+
+In explicit drop mode the :data:`~itemloaders.DROP` sentinel is the only value
+that means "do not produce a value". ``None``, empty strings, ``0``,
+``False`` and empty lists are ordinary data and are collected, while
+:data:`~itemloaders.DROP` is filtered out at every stage of the pipeline.
+
+Processors opt into the contract automatically when they run inside such a
+loader, through the loader context:
+
+* :class:`~itemloaders.processors.MapCompose` keeps ``None`` results instead of
+  filtering them, and only drops values returned as
+  :data:`~itemloaders.DROP`. When every input value is dropped, the processor
+  returns :data:`~itemloaders.DROP` itself.
+* :class:`~itemloaders.processors.Compose` no longer stops on ``None`` and
+  keeps passing it down the chain, while :data:`~itemloaders.DROP`
+  short-circuits the chain.
+* :class:`~itemloaders.processors.TakeFirst` returns the first value as is,
+  even when it is ``None``, an empty string, ``0`` or ``False``, skips
+  :data:`~itemloaders.DROP` entries and returns :data:`~itemloaders.DROP` when
+  nothing remains, so an empty input stays distinguishable from a ``None``
+  value. It can also be enabled standalone with
+  ``TakeFirst(explicit_drop=True)``.
+
+:meth:`~ItemLoader.replace_value` follows the same contract: replacing a field
+with :data:`~itemloaders.DROP` removes the values collected for that field,
+while replacing it with ``None`` collects ``None`` as the new value.
+
+Nested loaders inherit the mode from their parent, and the
+:data:`~itemloaders.DROP` sentinel can never reach the item returned by
+:meth:`~ItemLoader.load_item`. A field whose output processor returns
+:data:`~itemloaders.DROP` is absent from the item, whereas a field whose output
+is ``None`` is assigned ``None``.
+
+Without ``explicit_drop=True`` the historical behaviour is unchanged and
+``None`` keeps being ignored as a missing value.

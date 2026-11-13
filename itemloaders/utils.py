@@ -68,6 +68,21 @@ def arg_to_iter(arg: Any) -> Iterable[Any]:
     return [arg]
 
 
+def explicit_arg_to_iter(arg: Any) -> Iterable[Any]:
+    """Return an iterable based on *arg* using the explicit drop contract.
+
+    Unlike :func:`arg_to_iter`, ``None`` and empty iterables are kept as
+    atomic data values (wrapped in a list) instead of being flattened away.
+    Lists, tuples, sets and iterators are still returned as is.
+    """
+    if arg is None:
+        return [None]
+    iterable = arg_to_iter(arg)
+    if not iterable:
+        return [arg]
+    return iterable
+
+
 def get_func_args(func: Callable[..., Any], stripself: bool = False) -> list[str]:
     """Return the argument name list of a callable object"""
     if not callable(func):

@@ -14,6 +14,7 @@ from parsel import Selector  # noqa: TC002  # for sphinx
 from parsel.utils import extract_regex, flatten
 
 from itemloaders.common import wrap_loader_context
+from itemloaders.drop import DROP, EXPLICIT_DROP_CONTEXT_KEY
 from itemloaders.processors import Identity
 from itemloaders.utils import arg_to_iter
 
@@ -62,6 +63,15 @@ class ItemLoader:
 
     Pass *stats* to keep track of which parsing rules are being used, as
     described in :ref:`rule-usage`.
+
+    :param explicit_drop: when ``True``, enable the explicit drop contract.
+        In that mode the :data:`DROP` sentinel is the only value that means
+        "do not produce a value": ``None``, empty strings, ``0``, ``False``
+        and empty lists are treated as regular data and are collected. When
+        ``False`` (the default), the historical behaviour is kept and ``None``
+        is ignored like a missing value. Nested loaders inherit the value of
+        their parent.
+    :type explicit_drop: bool
 
     .. attribute:: item
 
@@ -125,6 +135,7 @@ class ItemLoader:
         selector: Selector | None = None,
         parent: ItemLoader | None = None,
         stats: _StatsCollector | None = None,
+        explicit_drop: bool | None = None,
         **context: Any,
     ):
         self.selector: Selector | None = selector
@@ -132,6 +143,13 @@ class ItemLoader:
             stats if stats is not None or parent is None else parent.stats
         )
         context.update(selector=selector)
+        if explicit_drop is None:
+            explicit_drop = (
+                bool(parent.context.get(EXPLICIT_DROP_CONTEXT_KEY, False))
+                if parent is not None
+                else False
+            )
+        context[EXPLICIT_DROP_CONTEXT_KEY] = explicit_drop
         # An item built here has no data, only the field defaults of its class,
         # which must not be mistaken for loaded values.
         has_initial_values = item is not None
@@ -145,7 +163,10 @@ class ItemLoader:
         if has_initial_values:
             for field_name, value in ItemAdapter(item).items():
                 self._values.setdefault(field_name, [])
-                self._values[field_name] += arg_to_iter(value)
+                if explicit_drop and value is None:
+                    self._values[field_name].append(None)
+                else:
+                    self._values[field_name] += arg_to_iter(value)
 
     @property
     def _values(self) -> dict[str, list[Any]]:
@@ -158,6 +179,11 @@ class ItemLoader:
         if self.parent is not None:
             return self.parent.item
         return self._local_item
+
+    @property
+    def explicit_drop(self) -> bool:
+        """Whether the loader uses the explicit :data:`DROP` contract."""
+        return bool(self.context.get(EXPLICIT_DROP_CONTEXT_KEY, False))
 
     def nested_xpath(self, xpath: str, **context: Any) -> Self:
         """
@@ -215,6 +241,11 @@ class ItemLoader:
         multiple fields may be added. And the processed value should be a dict
         with field_name mapped to values.
 
+        In explicit drop mode (``explicit_drop=True``), returning
+        :data:`DROP` (or mapping a field to it) skips the value, while
+        ``None`` is collected as data. In the default mode ``None`` is ignored
+        as a missing value.
+
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
 
@@ -228,10 +259,14 @@ class ItemLoader:
 
         """
         value = self.get_value(value, *processors, re=re, **kw)
-        if value is None:
+        if value is DROP:
+            return self
+        if value is None and not self.explicit_drop:
             return self
         if not field_name:
             for k, v in value.items():
+                if v is DROP:
+                    continue
                 self._add_value(k, v)
         else:
             self._add_value(field_name, value)
@@ -249,25 +284,49 @@ class ItemLoader:
         Similar to :meth:`add_value` but replaces the collected data with the
         new value instead of adding it.
 
+        In explicit drop mode, replacing a field with :data:`DROP` removes the
+        values collected for that field; replacing it with ``None`` collects
+        ``None`` as the new value. In the default mode, replacing with
+        ``None`` leaves the previously collected values untouched.
+
         :returns: The current ItemLoader instance for method chaining.
         :rtype: ItemLoader
         """
         value = self.get_value(value, *processors, re=re, **kw)
-        if value is None:
+        if value is DROP:
+            if field_name:
+                self._values.pop(field_name, None)
+            return self
+        if value is None and not self.explicit_drop:
             return self
         if not field_name:
             for k, v in value.items():
+                if v is DROP:
+                    self._values.pop(k, None)
+                    continue
                 self._replace_value(k, v)
         else:
             self._replace_value(field_name, value)
         return self
 
     def _add_value(self, field_name: str, value: Any) -> None:
-        value = arg_to_iter(value)
+        if self.explicit_drop:
+            if value is None:
+                value = [None]
+            elif not arg_to_iter(value):
+                return  # nothing was extracted, not an empty-list data point
+            value = arg_to_iter(value)
+        else:
+            value = arg_to_iter(value)
         processed_value = self._process_input_value(field_name, value)
+        # DROP is an explicit "no value" signal in every mode and must never be
+        # collected, while None, "", 0 and False remain data in explicit mode.
+        processed_value = [
+            item for item in arg_to_iter(processed_value) if item is not DROP
+        ]
         if processed_value:
             self._values.setdefault(field_name, [])
-            self._values[field_name] += arg_to_iter(processed_value)
+            self._values[field_name] += processed_value
 
     def _replace_value(self, field_name: str, value: Any) -> None:
         self._values.pop(field_name, None)
@@ -298,13 +357,19 @@ class ItemLoader:
         >>> loader = ItemLoader()
         >>> loader.get_value('name: foo', TakeFirst(), str.upper, re='name: (.+)')
         'FOO'
+
+        In explicit drop mode, processing stops and :data:`DROP` is returned
+        when a processor returns it, while ``None`` is passed to the remaining
+        processors instead of stopping the chain.
         """
         if re:
             value = arg_to_iter(value)
             value = flatten(extract_regex(re, x) for x in value)
 
         for proc in processors:
-            if value is None:
+            if value is DROP:
+                break
+            if value is None and not self.explicit_drop:
                 break
             _proc = proc
             proc = wrap_loader_context(proc, self.context)  # noqa: PLW2901
@@ -322,11 +387,18 @@ class ItemLoader:
         Populate the item with the data collected so far, and return it. The
         data collected is first passed through the :ref:`output processors
         <processors>` to get the final value to assign to each item field.
+
+        ``None`` output is assigned to the item in explicit drop mode, while
+        :data:`DROP` output always means that no value is assigned (and any
+        previously collected data for that field is left untouched in the
+        loader). The :data:`DROP` sentinel itself never reaches the item.
         """
         adapter = ItemAdapter(self.item)
         for field_name in tuple(self._values):
             value = self.get_output_value(field_name)
-            if value is not None:
+            if value is DROP:
+                continue
+            if value is not None or self.explicit_drop:
                 adapter[field_name] = value
 
         return adapter.item

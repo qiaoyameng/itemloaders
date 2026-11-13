@@ -5,6 +5,22 @@
 Release notes
 =============
 
+Unreleased
+----------
+
+-   Added an explicit drop contract to distinguish a value that is genuinely
+    ``None`` from a value that was not found. Pass ``explicit_drop=True`` to
+    :class:`ItemLoader` (nested loaders inherit it) and return the new
+    :data:`DROP` sentinel from processors to explicitly drop a value. In that
+    mode ``None``, empty strings, ``0``, ``False`` and empty lists are treated
+    as data, while only :data:`DROP` means "no value".
+    :class:`~itemloaders.processors.MapCompose`,
+    :class:`~itemloaders.processors.Compose` and
+    :class:`~itemloaders.processors.TakeFirst` follow the contract through the
+    loader context, and :meth:`~ItemLoader.replace_value` removes the collected
+    values of a field replaced with :data:`DROP`. The historical behaviour is
+    unchanged when the option is not enabled. See :ref:`explicit-drop`.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)
