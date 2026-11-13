@@ -13,13 +13,37 @@ from itemadapter import ItemAdapter
 from parsel import Selector  # noqa: TC002  # for sphinx
 from parsel.utils import extract_regex, flatten
 
-from itemloaders.common import wrap_loader_context
+from itemloaders.common import (
+    AsyncProcessorError,
+    _await_if_needed,
+    _reject_awaitable,
+    wrap_loader_context,
+)
 from itemloaders.processors import Identity
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, MutableMapping
     from re import Pattern
+
+
+async def _invoke_processor_async(
+    proc: Callable[..., Any], context: MutableMapping[str, Any], value: Any
+) -> Any:
+    """Invoke *proc* with *value* on an async code path.
+
+    Processor objects such as :class:`~itemloaders.processors.Compose` and
+    :class:`~itemloaders.processors.MapCompose` define an ``async_call``
+    coroutine method that walks their whole chain without leaking intermediate
+    awaitables. It must be looked up before :func:`wrap_loader_context`, since
+    a loader_context-aware object is otherwise turned into a ``partial``.
+    Plain callables and coroutine functions are handled uniformly by awaiting
+    the result when needed.
+    """
+    async_call = getattr(proc, "async_call", None)
+    if async_call is not None:
+        return await wrap_loader_context(async_call, context)(value)
+    return await _await_if_needed(wrap_loader_context(proc, context)(value))
 
 
 class _StatsCollector(Protocol):
@@ -237,6 +261,34 @@ class ItemLoader:
             self._add_value(field_name, value)
         return self
 
+    async def async_add_value(
+        self,
+        field_name: str | None,
+        value: Any,
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`add_value`.
+
+        The given ``processors`` and the field input processor may be
+        asynchronous. All processing must finish successfully before any
+        collected value is updated: if any step raises or is cancelled, the
+        previously collected values are left untouched.
+
+        :returns: The current ItemLoader instance for method chaining.
+        :rtype: ItemLoader
+        """
+        value = await self.async_get_value(value, *processors, re=re, **kw)
+        if value is None:
+            return self
+        if not field_name:
+            for k, v in value.items():
+                await self._async_add_value(k, v)
+        else:
+            await self._async_add_value(field_name, value)
+        return self
+
     def replace_value(
         self,
         field_name: str | None,
@@ -262,16 +314,61 @@ class ItemLoader:
             self._replace_value(field_name, value)
         return self
 
+    async def async_replace_value(
+        self,
+        field_name: str | None,
+        value: Any,
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`replace_value`.
+
+        As with :meth:`async_add_value`, the previously collected data is only
+        replaced once every processing step has completed successfully.
+
+        :returns: The current ItemLoader instance for method chaining.
+        :rtype: ItemLoader
+        """
+        value = await self.async_get_value(value, *processors, re=re, **kw)
+        if value is None:
+            return self
+        if not field_name:
+            for k, v in value.items():
+                await self._async_replace_value(k, v)
+        else:
+            await self._async_replace_value(field_name, value)
+        return self
+
     def _add_value(self, field_name: str, value: Any) -> None:
         value = arg_to_iter(value)
         processed_value = self._process_input_value(field_name, value)
+        _reject_awaitable(processed_value)
         if processed_value:
             self._values.setdefault(field_name, [])
             self._values[field_name] += arg_to_iter(processed_value)
 
     def _replace_value(self, field_name: str, value: Any) -> None:
+        value = arg_to_iter(value)
+        processed_value = self._process_input_value(field_name, value)
+        _reject_awaitable(processed_value)
         self._values.pop(field_name, None)
-        self._add_value(field_name, value)
+        if processed_value:
+            self._values[field_name] = arg_to_iter(processed_value)
+
+    async def _async_add_value(self, field_name: str, value: Any) -> None:
+        value = arg_to_iter(value)
+        processed_value = await self._async_process_input_value(field_name, value)
+        if processed_value:
+            self._values.setdefault(field_name, [])
+            self._values[field_name] += arg_to_iter(processed_value)
+
+    async def _async_replace_value(self, field_name: str, value: Any) -> None:
+        value = arg_to_iter(value)
+        processed_value = await self._async_process_input_value(field_name, value)
+        self._values.pop(field_name, None)
+        if processed_value:
+            self._values[field_name] = arg_to_iter(processed_value)
 
     def get_value(
         self,
@@ -315,6 +412,41 @@ class ItemLoader:
                     f"Error with processor {_proc.__class__.__name__} "
                     f"value={value!r} error='{type(e).__name__}: {e!s}'"
                 ) from e
+            _reject_awaitable(value)
+        return value
+
+    async def async_get_value(
+        self,
+        value: Any,
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Any:
+        """Asynchronous counterpart of :meth:`get_value`.
+
+        Each of the ``processors`` may be a regular callable or a coroutine
+        function, or a processor object exposing an ``async_call`` coroutine
+        method (as :class:`~itemloaders.processors.Compose` and
+        :class:`~itemloaders.processors.MapCompose` do). The processors are
+        awaited in order, and any plain (synchronous) return value is passed
+        through unchanged, so synchronous and asynchronous processors can be
+        mixed freely.
+        """
+        if re:
+            value = arg_to_iter(value)
+            value = flatten(extract_regex(re, x) for x in value)
+
+        for proc in processors:
+            if value is None:
+                break
+            _proc = proc
+            try:
+                value = await _invoke_processor_async(proc, self.context, value)
+            except Exception as e:
+                raise ValueError(
+                    f"Error with processor {_proc.__class__.__name__} "
+                    f"value={value!r} error='{type(e).__name__}: {e!s}'"
+                ) from e
         return value
 
     def load_item(self) -> Any:
@@ -326,6 +458,23 @@ class ItemLoader:
         adapter = ItemAdapter(self.item)
         for field_name in tuple(self._values):
             value = self.get_output_value(field_name)
+            _reject_awaitable(value)
+            if value is not None:
+                adapter[field_name] = value
+
+        return adapter.item
+
+    async def async_load_item(self) -> Any:
+        """Asynchronous counterpart of :meth:`load_item`.
+
+        Every field output processor may be asynchronous. The item is only
+        updated with a field once its output processor has completed
+        successfully, so a failure or cancellation leaves the already assigned
+        item fields intact and never stores an awaitable.
+        """
+        adapter = ItemAdapter(self.item)
+        for field_name in tuple(self._values):
+            value = await self.async_get_output_value(field_name)
             if value is not None:
                 adapter[field_name] = value
 
@@ -340,7 +489,29 @@ class ItemLoader:
         proc = wrap_loader_context(proc, self.context)
         value = self._values.get(field_name, [])
         try:
-            return proc(value)
+            result = proc(value)
+        except AsyncProcessorError:
+            # Keep an awaitable rejection a TypeError rather than wrapping it.
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"Error with output processor: field={field_name!r} "
+                f"value={value!r} error='{type(e).__name__}: {e!s}'"
+            ) from e
+        _reject_awaitable(result)
+        return result
+
+    async def async_get_output_value(self, field_name: str) -> Any:
+        """Asynchronous counterpart of :meth:`get_output_value`.
+
+        The collected values are passed through the field output processor,
+        which may be a coroutine function or an async-aware processor object.
+        This method doesn't populate or modify the item at all.
+        """
+        proc = self.get_output_processor(field_name)
+        value = self._values.get(field_name, [])
+        try:
+            return await _invoke_processor_async(proc, self.context, value)
         except Exception as e:
             raise ValueError(
                 f"Error with output processor: field={field_name!r} "
@@ -378,7 +549,26 @@ class ItemLoader:
         _proc = proc
         proc = wrap_loader_context(proc, self.context)
         try:
-            return proc(value)
+            result = proc(value)
+        except AsyncProcessorError:
+            # An awaitable reached through a synchronous entry point. The
+            # rejection must stay a TypeError rather than be wrapped.
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"Error with input processor {_proc.__class__.__name__}:"
+                f" field={field_name!r} value={value!r} error='{type(e).__name__}: {e!s}'"
+            ) from e
+        _reject_awaitable(result)
+        return result
+
+    async def _async_process_input_value(
+        self, field_name: str, value: Any
+    ) -> Any:
+        proc = self.get_input_processor(field_name)
+        _proc = proc
+        try:
+            return await _invoke_processor_async(proc, self.context, value)
         except Exception as e:
             raise ValueError(
                 f"Error with input processor {_proc.__class__.__name__}:"
@@ -432,6 +622,20 @@ class ItemLoader:
         values = self._get_xpathvalues(xpath, field_name, **kw)
         return self.add_value(field_name, values, *processors, re=re, **kw)
 
+    async def async_add_xpath(
+        self,
+        field_name: str | None,
+        xpath: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`add_xpath`."""
+        values = self._get_xpathvalues(xpath, field_name, **kw)
+        return await self.async_add_value(
+            field_name, values, *processors, re=re, **kw
+        )
+
     def replace_xpath(
         self,
         field_name: str | None,
@@ -449,6 +653,20 @@ class ItemLoader:
         """
         values = self._get_xpathvalues(xpath, field_name, **kw)
         return self.replace_value(field_name, values, *processors, re=re, **kw)
+
+    async def async_replace_xpath(
+        self,
+        field_name: str | None,
+        xpath: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`replace_xpath`."""
+        values = self._get_xpathvalues(xpath, field_name, **kw)
+        return await self.async_replace_value(
+            field_name, values, *processors, re=re, **kw
+        )
 
     def get_xpath(
         self,
@@ -478,6 +696,17 @@ class ItemLoader:
         """
         values = self._get_xpathvalues(xpath, **kw)
         return self.get_value(values, *processors, re=re, **kw)
+
+    async def async_get_xpath(
+        self,
+        xpath: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Any:
+        """Asynchronous counterpart of :meth:`get_xpath`."""
+        values = self._get_xpathvalues(xpath, **kw)
+        return await self.async_get_value(values, *processors, re=re, **kw)
 
     def _get_xpathvalues(
         self,
@@ -527,6 +756,20 @@ class ItemLoader:
         values = self._get_cssvalues(css, field_name)
         return self.add_value(field_name, values, *processors, re=re, **kw)
 
+    async def async_add_css(
+        self,
+        field_name: str | None,
+        css: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`add_css`."""
+        values = self._get_cssvalues(css, field_name)
+        return await self.async_add_value(
+            field_name, values, *processors, re=re, **kw
+        )
+
     def replace_css(
         self,
         field_name: str | None,
@@ -544,6 +787,20 @@ class ItemLoader:
         """
         values = self._get_cssvalues(css, field_name)
         return self.replace_value(field_name, values, *processors, re=re, **kw)
+
+    async def async_replace_css(
+        self,
+        field_name: str | None,
+        css: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`replace_css`."""
+        values = self._get_cssvalues(css, field_name)
+        return await self.async_replace_value(
+            field_name, values, *processors, re=re, **kw
+        )
 
     def get_css(
         self,
@@ -572,6 +829,17 @@ class ItemLoader:
         """
         values = self._get_cssvalues(css)
         return self.get_value(values, *processors, re=re, **kw)
+
+    async def async_get_css(
+        self,
+        css: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Any:
+        """Asynchronous counterpart of :meth:`get_css`."""
+        values = self._get_cssvalues(css)
+        return await self.async_get_value(values, *processors, re=re, **kw)
 
     def _get_cssvalues(
         self, csss: str | Iterable[str], field_name: str | None = None
@@ -615,6 +883,20 @@ class ItemLoader:
         values = self._get_jmesvalues(jmes, field_name)
         return self.add_value(field_name, values, *processors, re=re, **kw)
 
+    async def async_add_jmes(
+        self,
+        field_name: str | None,
+        jmes: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`add_jmes`."""
+        values = self._get_jmesvalues(jmes, field_name)
+        return await self.async_add_value(
+            field_name, values, *processors, re=re, **kw
+        )
+
     def replace_jmes(
         self,
         field_name: str | None,
@@ -631,6 +913,20 @@ class ItemLoader:
         """
         values = self._get_jmesvalues(jmes, field_name)
         return self.replace_value(field_name, values, *processors, re=re, **kw)
+
+    async def async_replace_jmes(
+        self,
+        field_name: str | None,
+        jmes: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Self:
+        """Asynchronous counterpart of :meth:`replace_jmes`."""
+        values = self._get_jmesvalues(jmes, field_name)
+        return await self.async_replace_value(
+            field_name, values, *processors, re=re, **kw
+        )
 
     def get_jmes(
         self,
@@ -659,6 +955,17 @@ class ItemLoader:
         """
         values = self._get_jmesvalues(jmes)
         return self.get_value(values, *processors, re=re, **kw)
+
+    async def async_get_jmes(
+        self,
+        jmes: str | Iterable[str],
+        *processors: Callable[..., Any],
+        re: str | Pattern[str] | None = None,
+        **kw: Any,
+    ) -> Any:
+        """Asynchronous counterpart of :meth:`get_jmes`."""
+        values = self._get_jmesvalues(jmes)
+        return await self.async_get_value(values, *processors, re=re, **kw)
 
     def _get_jmesvalues(
         self, jmess: str | Iterable[str], field_name: str | None = None

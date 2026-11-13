@@ -7,9 +7,15 @@ See documentation in :ref:`declaring-loaders`.
 from __future__ import annotations
 
 from collections import ChainMap
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 
-from itemloaders.common import wrap_loader_context
+from itemloaders.common import (
+    AsyncProcessorError,
+    _await_if_needed,
+    _reject_awaitable,
+    wrap_loader_context,
+)
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
@@ -64,26 +70,70 @@ class MapCompose:
         self.functions = functions
         self.default_loader_context = default_loader_context
 
+    def _build_context(
+        self, loader_context: MutableMapping[str, Any] | None
+    ) -> MutableMapping[str, Any]:
+        if loader_context:
+            return ChainMap(loader_context, self.default_loader_context)
+        return self.default_loader_context
+
     def __call__(
         self, value: Any, loader_context: MutableMapping[str, Any] | None = None
     ) -> Iterable[Any]:
         values = arg_to_iter(value)
-        context: MutableMapping[str, Any]
-        if loader_context:
-            context = ChainMap(loader_context, self.default_loader_context)
-        else:
-            context = self.default_loader_context
+        context = self._build_context(loader_context)
+        wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
+        for func in wrapped_funcs:
+            next_values: list[Any] = []
+            for v in values:
+                result: Any = None
+                got_awaitable = False
+                try:
+                    result = func(v)
+                    got_awaitable = isinstance(result, Awaitable)
+                    if got_awaitable:
+                        _reject_awaitable(result)
+                except Exception as e:
+                    for pending in next_values:
+                        if isinstance(pending, Awaitable):
+                            close = getattr(pending, "close", None)
+                            if close is not None:
+                                close()
+                    # An awaitable rejection propagates as its own error, while a
+                    # plain function error keeps the historical ValueError
+                    # wrapping.
+                    if got_awaitable:
+                        raise
+                    raise ValueError(
+                        f"Error in MapCompose with "
+                        f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
+                    ) from e
+                next_values += arg_to_iter(result)
+            values = next_values
+        return values
+
+    async def async_call(
+        self, value: Any, loader_context: MutableMapping[str, Any] | None = None
+    ) -> Iterable[Any]:
+        """Asynchronous counterpart of :meth:`__call__`.
+
+        Every function in the chain may be either synchronous or a coroutine
+        function. The chain is awaited in order, one element at a time.
+        """
+        values = arg_to_iter(value)
+        context = self._build_context(loader_context)
         wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
         for func in wrapped_funcs:
             next_values: list[Any] = []
             for v in values:
                 try:
-                    next_values += arg_to_iter(func(v))
+                    result = await _await_if_needed(func(v))
                 except Exception as e:
                     raise ValueError(
                         f"Error in MapCompose with "
                         f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
                     ) from e
+                next_values += arg_to_iter(result)
             values = next_values
         return values
 
@@ -122,20 +172,48 @@ class Compose:
         self.stop_on_none = default_loader_context.get("stop_on_none", True)
         self.default_loader_context = default_loader_context
 
+    def _build_context(
+        self, loader_context: MutableMapping[str, Any] | None
+    ) -> MutableMapping[str, Any]:
+        if loader_context:
+            return ChainMap(loader_context, self.default_loader_context)
+        return self.default_loader_context
+
     def __call__(
         self, value: Any, loader_context: MutableMapping[str, Any] | None = None
     ) -> Any:
-        context: MutableMapping[str, Any]
-        if loader_context:
-            context = ChainMap(loader_context, self.default_loader_context)
-        else:
-            context = self.default_loader_context
+        context = self._build_context(loader_context)
         wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
         for func in wrapped_funcs:
             if value is None and self.stop_on_none:
                 break
             try:
                 value = func(value)
+                _reject_awaitable(value)
+            except AsyncProcessorError:
+                raise
+            except Exception as e:
+                raise ValueError(
+                    f"Error in Compose with "
+                    f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
+                ) from e
+        return value
+
+    async def async_call(
+        self, value: Any, loader_context: MutableMapping[str, Any] | None = None
+    ) -> Any:
+        """Asynchronous counterpart of :meth:`__call__`.
+
+        Every function in the chain may be either synchronous or a coroutine
+        function. The chain is awaited in order.
+        """
+        context = self._build_context(loader_context)
+        wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
+        for func in wrapped_funcs:
+            if value is None and self.stop_on_none:
+                break
+            try:
+                value = await _await_if_needed(func(value))
             except Exception as e:
                 raise ValueError(
                     f"Error in Compose with "
