@@ -6,7 +6,7 @@ See documentation in :ref:`declaring-loaders`.
 
 from __future__ import annotations
 
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Any, Protocol, Self
 
 from itemadapter import ItemAdapter
@@ -18,7 +18,7 @@ from itemloaders.processors import Identity
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, MutableMapping
+    from collections.abc import Callable, Iterable, Iterator, MutableMapping
     from re import Pattern
 
 
@@ -35,6 +35,54 @@ def unbound_method(method: Callable[..., Any]) -> Callable[..., Any]:
         if "." not in method.__qualname__:
             return method.__func__  # type: ignore[attr-defined, no-any-return]
     return method
+
+
+class _TransactionState:
+    """Snapshot of the loader state managed by :meth:`ItemLoader.transaction`.
+
+    Covers the collected values, the item fields and the rule-usage stats
+    increments of a single transaction frame. Anything user callbacks do
+    outside of the loader (e.g. writing to files or sockets) is not tracked.
+    """
+
+    def __init__(self, root: ItemLoader) -> None:
+        self._root = root
+        self._values = {
+            field_name: list(values)
+            for field_name, values in root._local_values.items()
+        }
+        adapter = ItemAdapter(root._local_item)
+        self._item = root._local_item
+        self._item_values = {
+            field_name: adapter[field_name]
+            for field_name in adapter.field_names()
+            if field_name in adapter
+        }
+        self._stats_log: list[tuple[str, int]] = []
+
+    def track_stats(self, key: str, count: int) -> None:
+        self._stats_log.append((key, count))
+
+    def commit(self) -> None:
+        """Merge this frame into the enclosing transaction, if any."""
+        frames = self._root._transaction_frames
+        if frames:
+            frames[-1]._stats_log.extend(self._stats_log)
+
+    def rollback(self) -> None:
+        root = self._root
+        root._local_values.clear()
+        root._local_values.update(self._values)
+        adapter = ItemAdapter(self._item)
+        for field_name in adapter.field_names():
+            if field_name in self._item_values:
+                adapter[field_name] = self._item_values[field_name]
+            elif field_name in adapter:
+                del adapter[field_name]
+        stats = root.stats
+        if stats is not None:
+            for key, count in reversed(self._stats_log):
+                stats.inc_value(key, -count)
 
 
 class ItemLoader:
@@ -142,10 +190,18 @@ class ItemLoader:
         self.context: MutableMapping[str, Any] = context
         self.parent: ItemLoader | None = parent
         self._local_values: dict[str, list[Any]] = {}
+        self._transaction_frames: list[_TransactionState] = []
         if has_initial_values:
             for field_name, value in ItemAdapter(item).items():
                 self._values.setdefault(field_name, [])
                 self._values[field_name] += arg_to_iter(value)
+
+    @property
+    def _transaction_root(self) -> ItemLoader:
+        loader = self
+        while loader.parent is not None:
+            loader = loader.parent
+        return loader
 
     @property
     def _values(self) -> dict[str, list[Any]]:
@@ -193,6 +249,53 @@ class ItemLoader:
         inherited = {key: value for key, value in self.context.items() if key != "item"}
         inherited.update(context)
         return inherited
+
+    @contextmanager
+    def transaction(self) -> Iterator[Self]:
+        """
+        Group loader operations into an all-or-nothing unit of work.
+
+        If the wrapped block raises, every change made inside it through
+        :meth:`add_value`, :meth:`replace_value`, their selector-based
+        variants and :meth:`load_item` is reverted: the collected values,
+        the item fields and the :ref:`rule-usage <rule-usage>` stats are
+        restored to the state they had when the transaction started. The
+        same loader instance stays usable afterwards, so a failed record
+        can be skipped without rebuilding the loader::
+
+            for record in records:
+                try:
+                    with loader.transaction():
+                        loader.add_value("price", record["price"])
+                        loader.add_value("currency", record["currency"])
+                        loader.add_value("stock", record["stock"])
+                        item = loader.load_item()
+                except ValueError:
+                    continue
+
+        Transactions started on nested loaders (see :ref:`nested-loaders
+        <nested-loaders>`) cover the value pool shared with their parent.
+        Transactions can also be nested: an inner transaction that exits
+        cleanly is still rolled back if an outer transaction fails.
+
+        Only state managed by the loader itself is rolled back. Side
+        effects of user callbacks (e.g. processors writing to files or
+        sockets) are outside the scope of this guarantee.
+
+        .. versionadded:: VERSION
+        """
+        root = self._transaction_root
+        frame = _TransactionState(root)
+        root._transaction_frames.append(frame)
+        try:
+            yield self
+        except BaseException:
+            root._transaction_frames.pop()
+            frame.rollback()
+            raise
+        else:
+            root._transaction_frames.pop()
+            frame.commit()
 
     def add_value(
         self,
@@ -390,7 +493,11 @@ class ItemLoader:
     ) -> list[Any]:
         if self.stats is not None:
             key = f"parser/{field_name or '<none>'}/{rule_type}/{rule}"
-            self.stats.inc_value(key, 1 if values else 0)
+            count = 1 if values else 0
+            self.stats.inc_value(key, count)
+            frames = self._transaction_root._transaction_frames
+            if frames and count:
+                frames[-1].track_stats(key, count)
         return values
 
     def _check_selector_method(self) -> None:
